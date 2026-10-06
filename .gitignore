@@ -1,0 +1,15 @@
+@"
+build/
+cmake-build-*/
+out/
+.vs/
+.vscode/
+.idea/
+*.o
+*.a
+*.so
+*.dll
+*.exe
+*.log
+.DS_Store
+"@ | Set-Content .gitignore
