@@ -1,12 +1,15 @@
 #include <cstdlib>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
 #include "cluster/cluster_manager.h"
 #include "network/tcp_client.h"
 #include "network/tcp_server.h"
+#include "sharding/shard_manager.h"
 
 using namespace std;
 
@@ -24,51 +27,107 @@ struct NodeConfig {
 
 // ============================================================
 // Local Storage Engine
-// Temporary in-memory engine.
-// Later this will become WAL + MemTable + SSTables.
+//
+// Still temporary.
+//
+// Later:
+//
+// WAL
+//   ↓
+// MemTable
+//   ↓
+// SSTables
 // ============================================================
 
 class StorageEngine {
 private:
     unordered_map<string, string> data;
 
+    mutable mutex dataMutex;
+
 public:
     void put(
         const string& key,
         const string& value
     ) {
+        lock_guard<mutex> lock(
+            dataMutex
+        );
+
         data[key] = value;
-        cout << "OK: Value stored\n";
     }
 
-    void get(
-        const string& key
+    bool get(
+        const string& key,
+        string& value
     ) const {
-        auto it = data.find(key);
+        lock_guard<mutex> lock(
+            dataMutex
+        );
+
+        auto it =
+            data.find(key);
 
         if (it == data.end()) {
-            cout << "NOT FOUND\n";
-            return;
+            return false;
         }
 
-        cout << it->second << '\n';
+        value = it->second;
+
+        return true;
     }
 
-    void erase(
+    bool erase(
         const string& key
     ) {
-        if (data.erase(key)) {
-            cout << "OK: Key deleted\n";
-        }
-        else {
-            cout << "NOT FOUND\n";
-        }
+        lock_guard<mutex> lock(
+            dataMutex
+        );
+
+        return data.erase(key) > 0;
     }
 
     size_t size() const {
+        lock_guard<mutex> lock(
+            dataMutex
+        );
+
         return data.size();
     }
 };
+
+// ============================================================
+// Helpers
+// ============================================================
+
+vector<ShardNode> buildShardNodes(
+    const NodeConfig& config
+) {
+    vector<ShardNode> nodes;
+
+    nodes.push_back(
+        {
+            config.nodeId,
+            config.host,
+            config.port
+        }
+    );
+
+    for (
+        const auto& peer :
+        config.peers
+    ) {
+        nodes.push_back(
+            {
+                peer.nodeId,
+                peer.host,
+                peer.port
+            }
+        );
+    }
+
+    return nodes;
+}
 
 // ============================================================
 // HydraDB Node
@@ -77,20 +136,194 @@ public:
 class HydraNode {
 private:
     NodeConfig config;
+
     StorageEngine storage;
+
     string state = "STARTING";
+
+    ShardManager shardManager;
+
     TcpServer networkServer;
+
     ClusterManager clusterManager;
+
+    // --------------------------------------------------------
+    // Request coming from another HydraDB node.
+    // --------------------------------------------------------
+
+    string handleNetworkRequest(
+        const string& request
+    ) {
+        istringstream input(
+            request
+        );
+
+        string command;
+
+        input >> command;
+
+        // ====================================================
+        // Remote PUT
+        // ====================================================
+
+        if (command == "KVPUT") {
+
+            string key;
+
+            if (!(input >> key)) {
+                return "ERROR INVALID_KVPUT";
+            }
+
+            string value;
+
+            getline(
+                input >> ws,
+                value
+            );
+
+            if (value.empty()) {
+                return "ERROR INVALID_KVPUT";
+            }
+
+            ShardNode owner =
+                shardManager.ownerForKey(
+                    key
+                );
+
+            if (
+                owner.nodeId !=
+                config.nodeId
+            ) {
+                return
+                    "ERROR WRONG_OWNER " +
+                    owner.nodeId;
+            }
+
+            storage.put(
+                key,
+                value
+            );
+
+            size_t shardId =
+                shardManager.shardForKey(
+                    key
+                );
+
+            return
+                "OK STORED " +
+                config.nodeId +
+                " SHARD " +
+                to_string(shardId);
+        }
+
+        // ====================================================
+        // Remote GET
+        // ====================================================
+
+        if (command == "KVGET") {
+
+            string key;
+
+            if (!(input >> key)) {
+                return "ERROR INVALID_KVGET";
+            }
+
+            ShardNode owner =
+                shardManager.ownerForKey(
+                    key
+                );
+
+            if (
+                owner.nodeId !=
+                config.nodeId
+            ) {
+                return
+                    "ERROR WRONG_OWNER " +
+                    owner.nodeId;
+            }
+
+            string value;
+
+            if (
+                !storage.get(
+                    key,
+                    value
+                )
+            ) {
+                return "NOT_FOUND";
+            }
+
+            return
+                "VALUE " +
+                value;
+        }
+
+        // ====================================================
+        // Remote DELETE
+        // ====================================================
+
+        if (command == "KVDELETE") {
+
+            string key;
+
+            if (!(input >> key)) {
+                return
+                    "ERROR INVALID_KVDELETE";
+            }
+
+            ShardNode owner =
+                shardManager.ownerForKey(
+                    key
+                );
+
+            if (
+                owner.nodeId !=
+                config.nodeId
+            ) {
+                return
+                    "ERROR WRONG_OWNER " +
+                    owner.nodeId;
+            }
+
+            if (
+                storage.erase(key)
+            ) {
+                return "OK DELETED";
+            }
+
+            return "NOT_FOUND";
+        }
+
+        return "ERROR UNKNOWN_COMMAND";
+    }
 
 public:
     explicit HydraNode(
         const NodeConfig& nodeConfig
     )
         : config(nodeConfig),
+
+          shardManager(
+              buildShardNodes(
+                  nodeConfig
+              ),
+              1024
+          ),
+
           networkServer(
               nodeConfig.nodeId,
-              nodeConfig.port
+              nodeConfig.port,
+
+              [this](
+                  const string& request
+              ) {
+                  return
+                      handleNetworkRequest(
+                          request
+                      );
+              }
           ),
+
           clusterManager(
               nodeConfig.nodeId,
               nodeConfig.peers
@@ -100,6 +333,7 @@ public:
     bool start() {
         if (!networkServer.start()) {
             state = "FAILED";
+
             return false;
         }
 
@@ -107,130 +341,356 @@ public:
 
         state = "RUNNING";
 
-        cout << "=================================\n";
-        cout << "          HydraDB Node\n";
-        cout << "=================================\n";
+        cout
+            << "=================================\n";
 
-        cout << "Node ID:  "
-             << config.nodeId
-             << '\n';
+        cout
+            << "          HydraDB Node\n";
 
-        cout << "Address:  "
-             << config.host
-             << ':'
-             << config.port
-             << '\n';
+        cout
+            << "=================================\n";
 
-        cout << "State:    "
-             << state
-             << '\n';
+        cout
+            << "Node ID:  "
+            << config.nodeId
+            << '\n';
 
-        cout << "Storage:  In-memory\n";
+        cout
+            << "Address:  "
+            << config.host
+            << ':'
+            << config.port
+            << '\n';
 
-        cout << "Network:  TCP\n";
+        cout
+            << "State:    "
+            << state
+            << '\n';
 
-        cout << "Peers:    "
-             << clusterManager.peerCount()
-             << '\n';
+        cout
+            << "Storage:  In-memory\n";
 
-        cout << "=================================\n";
+        cout
+            << "Network:  TCP\n";
 
-        cout << "Type HELP for commands\n\n";
+        cout
+            << "Peers:    "
+            << clusterManager.peerCount()
+            << '\n';
+
+        cout
+            << "Shards:   "
+            << shardManager.getShardCount()
+            << '\n';
+
+        cout
+            << "=================================\n";
+
+        cout
+            << "Type HELP for commands\n\n";
 
         return true;
     }
 
-    void status() const {
-        cout << "\nHydraDB Node Status\n";
-        cout << "---------------------------------\n";
+    // ========================================================
+    // Distributed PUT
+    // ========================================================
 
-        cout << "Node ID:  "
-             << config.nodeId
-             << '\n';
+    void put(
+        const string& key,
+        const string& value
+    ) {
+        size_t shardId =
+            shardManager.shardForKey(
+                key
+            );
 
-        cout << "Address:  "
-             << config.host
-             << ':'
-             << config.port
-             << '\n';
+        ShardNode owner =
+            shardManager.ownerForKey(
+                key
+            );
 
-        cout << "State:    "
-             << state
-             << '\n';
+        if (
+            owner.nodeId ==
+            config.nodeId
+        ) {
+            storage.put(
+                key,
+                value
+            );
 
-        cout << "Network:  "
-             << (
-                    networkServer.isRunning()
-                    ? "RUNNING"
-                    : "STOPPED"
+            cout
+                << "OK: stored locally"
+                << " | shard="
+                << shardId
+                << " | owner="
+                << owner.nodeId
+                << '\n';
+
+            return;
+        }
+
+        string response =
+            TcpClient::request(
+                owner.host,
+                owner.port,
+                "KVPUT " +
+                    key +
+                    " " +
+                    value
+            );
+
+        cout
+            << "ROUTED -> "
+            << owner.nodeId
+            << " | shard="
+            << shardId
+            << '\n';
+
+        cout
+            << response
+            << '\n';
+    }
+
+    // ========================================================
+    // Distributed GET
+    // ========================================================
+
+    void get(
+        const string& key
+    ) const {
+        size_t shardId =
+            shardManager.shardForKey(
+                key
+            );
+
+        ShardNode owner =
+            shardManager.ownerForKey(
+                key
+            );
+
+        if (
+            owner.nodeId ==
+            config.nodeId
+        ) {
+            string value;
+
+            if (
+                storage.get(
+                    key,
+                    value
                 )
-             << '\n';
+            ) {
+                cout
+                    << value
+                    << '\n';
+            }
+            else {
+                cout
+                    << "NOT_FOUND\n";
+            }
 
-        cout << "Peers:    "
-             << clusterManager.peerCount()
-             << '\n';
+            return;
+        }
 
-        cout << "Records:  "
-             << storage.size()
-             << '\n';
+        string response =
+            TcpClient::request(
+                owner.host,
+                owner.port,
+                "KVGET " +
+                    key
+            );
 
-        cout << "Storage:  In-memory\n\n";
+        cout
+            << "ROUTED -> "
+            << owner.nodeId
+            << " | shard="
+            << shardId
+            << '\n';
+
+        if (
+            response.rfind(
+                "VALUE ",
+                0
+            ) == 0
+        ) {
+            cout
+                << response.substr(6)
+                << '\n';
+        }
+        else {
+            cout
+                << response
+                << '\n';
+        }
+    }
+
+    // ========================================================
+    // Distributed DELETE
+    // ========================================================
+
+    void erase(
+        const string& key
+    ) {
+        size_t shardId =
+            shardManager.shardForKey(
+                key
+            );
+
+        ShardNode owner =
+            shardManager.ownerForKey(
+                key
+            );
+
+        if (
+            owner.nodeId ==
+            config.nodeId
+        ) {
+            if (
+                storage.erase(key)
+            ) {
+                cout
+                    << "OK: deleted locally\n";
+            }
+            else {
+                cout
+                    << "NOT_FOUND\n";
+            }
+
+            return;
+        }
+
+        string response =
+            TcpClient::request(
+                owner.host,
+                owner.port,
+                "KVDELETE " +
+                    key
+            );
+
+        cout
+            << "ROUTED -> "
+            << owner.nodeId
+            << " | shard="
+            << shardId
+            << '\n';
+
+        cout
+            << response
+            << '\n';
+    }
+
+    // ========================================================
+    // Status
+    // ========================================================
+
+    void status() const {
+        cout
+            << "\nHydraDB Node Status\n";
+
+        cout
+            << "---------------------------------\n";
+
+        cout
+            << "Node ID:       "
+            << config.nodeId
+            << '\n';
+
+        cout
+            << "Address:       "
+            << config.host
+            << ':'
+            << config.port
+            << '\n';
+
+        cout
+            << "State:         "
+            << state
+            << '\n';
+
+        cout
+            << "Network:       "
+            << (
+                networkServer.isRunning()
+                ? "RUNNING"
+                : "STOPPED"
+            )
+            << '\n';
+
+        cout
+            << "Peers:         "
+            << clusterManager.peerCount()
+            << '\n';
+
+        cout
+            << "Virtual shards:"
+            << ' '
+            << shardManager.getShardCount()
+            << '\n';
+
+        cout
+            << "Local records: "
+            << storage.size()
+            << '\n';
+
+        cout
+            << "Storage:       In-memory\n\n";
     }
 
     void clusterStatus() const {
         clusterManager.printClusterStatus();
     }
 
-    void put(
-        const string& key,
-        const string& value
-    ) {
-        storage.put(key, value);
-    }
-
-    void get(
+    void route(
         const string& key
     ) const {
-        storage.get(key);
+        shardManager.printRoute(
+            key
+        );
     }
 
-    void erase(
-        const string& key
-    ) {
-        storage.erase(key);
+    void shardStatus() const {
+        shardManager.printDistribution();
     }
+
+    // ========================================================
+    // Networking diagnostics
+    // ========================================================
 
     void pingNode(
         const string& host,
         int port
     ) const {
-        cout << "PING "
-             << host
-             << ':'
-             << port
-             << " ... ";
+        cout
+            << "PING "
+            << host
+            << ':'
+            << port
+            << " ... ";
 
-        string response =
-            TcpClient::ping(host, port);
-
-        cout << response << '\n';
+        cout
+            << TcpClient::ping(
+                host,
+                port
+            )
+            << '\n';
     }
 
     void infoNode(
         const string& host,
         int port
     ) const {
-        string response =
-            TcpClient::info(host, port);
-
-        cout << response << '\n';
+        cout
+            << TcpClient::info(
+                host,
+                port
+            )
+            << '\n';
     }
 };
 
 // ============================================================
-// Peer Parsing
-//
-// Format:
+// Peer Parser
 //
 // node-2@127.0.0.1:5002
 // ============================================================
@@ -242,7 +702,10 @@ bool parsePeer(
     size_t atPosition =
         value.find('@');
 
-    if (atPosition == string::npos) {
+    if (
+        atPosition ==
+        string::npos
+    ) {
         return false;
     }
 
@@ -252,7 +715,10 @@ bool parsePeer(
             atPosition + 1
         );
 
-    if (colonPosition == string::npos) {
+    if (
+        colonPosition ==
+        string::npos
+    ) {
         return false;
     }
 
@@ -265,7 +731,9 @@ bool parsePeer(
     peer.host =
         value.substr(
             atPosition + 1,
-            colonPosition - atPosition - 1
+            colonPosition -
+                atPosition -
+                1
         );
 
     string portValue =
@@ -282,20 +750,16 @@ bool parsePeer(
     }
 
     try {
-        peer.port = stoi(portValue);
+        peer.port =
+            stoi(portValue);
     }
     catch (...) {
         return false;
     }
 
-    if (
-        peer.port < 1 ||
-        peer.port > 65535
-    ) {
-        return false;
-    }
-
-    return true;
+    return
+        peer.port >= 1 &&
+        peer.port <= 65535;
 }
 
 // ============================================================
@@ -317,28 +781,23 @@ void printProgramHelp() {
     cout << "Options:\n";
 
     cout
-        << "  --node-id <id>          "
-        << "Node identifier\n";
+        << "  --node-id <id>\n";
 
     cout
-        << "  --host <host>           "
-        << "Node host address\n";
+        << "  --host <host>\n";
 
     cout
-        << "  --port <port>           "
-        << "Node TCP port\n";
+        << "  --port <port>\n";
 
     cout
-        << "  --peer <id@host:port>   "
-        << "Cluster peer; may be repeated\n";
+        << "  --peer <id@host:port>\n";
 
     cout
-        << "  --help, -h              "
-        << "Show this help\n";
+        << "  --help, -h\n";
 }
 
 // ============================================================
-// Command-line Argument Parsing
+// Arguments
 // ============================================================
 
 bool parseArguments(
@@ -354,13 +813,13 @@ bool parseArguments(
         string argument =
             argv[i];
 
-        // ----------------------------------------------------
-        // Node ID
-        // ----------------------------------------------------
-
-        if (argument == "--node-id") {
-
-            if (i + 1 >= argc) {
+        if (
+            argument ==
+            "--node-id"
+        ) {
+            if (
+                i + 1 >= argc
+            ) {
                 cerr
                     << "Missing value for --node-id\n";
 
@@ -371,13 +830,13 @@ bool parseArguments(
                 argv[++i];
         }
 
-        // ----------------------------------------------------
-        // Host
-        // ----------------------------------------------------
-
-        else if (argument == "--host") {
-
-            if (i + 1 >= argc) {
+        else if (
+            argument ==
+            "--host"
+        ) {
+            if (
+                i + 1 >= argc
+            ) {
                 cerr
                     << "Missing value for --host\n";
 
@@ -388,13 +847,13 @@ bool parseArguments(
                 argv[++i];
         }
 
-        // ----------------------------------------------------
-        // Port
-        // ----------------------------------------------------
-
-        else if (argument == "--port") {
-
-            if (i + 1 >= argc) {
+        else if (
+            argument ==
+            "--port"
+        ) {
+            if (
+                i + 1 >= argc
+            ) {
                 cerr
                     << "Missing value for --port\n";
 
@@ -406,7 +865,9 @@ bool parseArguments(
                     stoi(argv[++i]);
             }
             catch (...) {
-                cerr << "Invalid port\n";
+                cerr
+                    << "Invalid port\n";
+
                 return false;
             }
 
@@ -415,20 +876,19 @@ bool parseArguments(
                 config.port > 65535
             ) {
                 cerr
-                    << "Port must be between "
-                    << "1 and 65535\n";
+                    << "Port must be between 1 and 65535\n";
 
                 return false;
             }
         }
 
-        // ----------------------------------------------------
-        // Peer
-        // ----------------------------------------------------
-
-        else if (argument == "--peer") {
-
-            if (i + 1 >= argc) {
+        else if (
+            argument ==
+            "--peer"
+        ) {
+            if (
+                i + 1 >= argc
+            ) {
                 cerr
                     << "Missing value for --peer\n";
 
@@ -451,10 +911,6 @@ bool parseArguments(
                     << peerValue
                     << '\n';
 
-                cerr
-                    << "Expected format: "
-                    << "node-id@host:port\n";
-
                 return false;
             }
 
@@ -463,8 +919,7 @@ bool parseArguments(
                 config.nodeId
             ) {
                 cerr
-                    << "Cannot add local node "
-                    << "as its own peer\n";
+                    << "Cannot add local node as peer\n";
 
                 return false;
             }
@@ -474,10 +929,6 @@ bool parseArguments(
             );
         }
 
-        // ----------------------------------------------------
-        // Help
-        // ----------------------------------------------------
-
         else if (
             argument == "--help" ||
             argument == "-h"
@@ -486,10 +937,6 @@ bool parseArguments(
 
             exit(0);
         }
-
-        // ----------------------------------------------------
-        // Unknown
-        // ----------------------------------------------------
 
         else {
             cerr
@@ -505,7 +952,7 @@ bool parseArguments(
 }
 
 // ============================================================
-// Interactive CLI Help
+// CLI Help
 // ============================================================
 
 void printCommandHelp() {
@@ -524,16 +971,22 @@ void printCommandHelp() {
         << "DELETE <key>\n";
 
     cout
-        << "PING <host> <port>\n";
+        << "ROUTE <key>\n";
 
     cout
-        << "INFO <host> <port>\n";
+        << "SHARDS\n";
+
+    cout
+        << "CLUSTER\n";
 
     cout
         << "STATUS\n";
 
     cout
-        << "CLUSTER\n";
+        << "PING <host> <port>\n";
+
+    cout
+        << "INFO <host> <port>\n";
 
     cout
         << "HELP\n";
@@ -562,7 +1015,9 @@ int main(
         return 1;
     }
 
-    HydraNode node(config);
+    HydraNode node(
+        config
+    );
 
     if (!node.start()) {
         cerr
@@ -573,19 +1028,23 @@ int main(
 
     string line;
 
-    // ========================================================
-    // CLI Loop
-    // ========================================================
-
     while (true) {
 
-        cout << "hydra> ";
+        cout
+            << "hydra> ";
 
-        if (!getline(cin, line)) {
+        if (
+            !getline(
+                cin,
+                line
+            )
+        ) {
             break;
         }
 
-        istringstream input(line);
+        istringstream input(
+            line
+        );
 
         string command;
 
@@ -595,9 +1054,9 @@ int main(
             continue;
         }
 
-        // ----------------------------------------------------
+        // ====================================================
         // PUT
-        // ----------------------------------------------------
+        // ====================================================
 
         if (
             command == "PUT" ||
@@ -607,8 +1066,7 @@ int main(
 
             if (!(input >> key)) {
                 cout
-                    << "Usage: "
-                    << "PUT <key> <value>\n";
+                    << "Usage: PUT <key> <value>\n";
 
                 continue;
             }
@@ -622,8 +1080,7 @@ int main(
 
             if (value.empty()) {
                 cout
-                    << "Usage: "
-                    << "PUT <key> <value>\n";
+                    << "Usage: PUT <key> <value>\n";
 
                 continue;
             }
@@ -634,9 +1091,9 @@ int main(
             );
         }
 
-        // ----------------------------------------------------
+        // ====================================================
         // GET
-        // ----------------------------------------------------
+        // ====================================================
 
         else if (
             command == "GET" ||
@@ -646,18 +1103,19 @@ int main(
 
             if (!(input >> key)) {
                 cout
-                    << "Usage: "
-                    << "GET <key>\n";
+                    << "Usage: GET <key>\n";
 
                 continue;
             }
 
-            node.get(key);
+            node.get(
+                key
+            );
         }
 
-        // ----------------------------------------------------
+        // ====================================================
         // DELETE
-        // ----------------------------------------------------
+        // ====================================================
 
         else if (
             command == "DELETE" ||
@@ -667,18 +1125,74 @@ int main(
 
             if (!(input >> key)) {
                 cout
-                    << "Usage: "
-                    << "DELETE <key>\n";
+                    << "Usage: DELETE <key>\n";
 
                 continue;
             }
 
-            node.erase(key);
+            node.erase(
+                key
+            );
         }
 
-        // ----------------------------------------------------
-        // Manual PING
-        // ----------------------------------------------------
+        // ====================================================
+        // ROUTE
+        // ====================================================
+
+        else if (
+            command == "ROUTE" ||
+            command == "route"
+        ) {
+            string key;
+
+            if (!(input >> key)) {
+                cout
+                    << "Usage: ROUTE <key>\n";
+
+                continue;
+            }
+
+            node.route(
+                key
+            );
+        }
+
+        // ====================================================
+        // SHARDS
+        // ====================================================
+
+        else if (
+            command == "SHARDS" ||
+            command == "shards"
+        ) {
+            node.shardStatus();
+        }
+
+        // ====================================================
+        // CLUSTER
+        // ====================================================
+
+        else if (
+            command == "CLUSTER" ||
+            command == "cluster"
+        ) {
+            node.clusterStatus();
+        }
+
+        // ====================================================
+        // STATUS
+        // ====================================================
+
+        else if (
+            command == "STATUS" ||
+            command == "status"
+        ) {
+            node.status();
+        }
+
+        // ====================================================
+        // PING
+        // ====================================================
 
         else if (
             command == "PING" ||
@@ -691,18 +1205,7 @@ int main(
                 !(input >> host >> port)
             ) {
                 cout
-                    << "Usage: "
-                    << "PING <host> <port>\n";
-
-                continue;
-            }
-
-            if (
-                port < 1 ||
-                port > 65535
-            ) {
-                cout
-                    << "Invalid port\n";
+                    << "Usage: PING <host> <port>\n";
 
                 continue;
             }
@@ -713,9 +1216,9 @@ int main(
             );
         }
 
-        // ----------------------------------------------------
-        // Node INFO
-        // ----------------------------------------------------
+        // ====================================================
+        // INFO
+        // ====================================================
 
         else if (
             command == "INFO" ||
@@ -728,18 +1231,7 @@ int main(
                 !(input >> host >> port)
             ) {
                 cout
-                    << "Usage: "
-                    << "INFO <host> <port>\n";
-
-                continue;
-            }
-
-            if (
-                port < 1 ||
-                port > 65535
-            ) {
-                cout
-                    << "Invalid port\n";
+                    << "Usage: INFO <host> <port>\n";
 
                 continue;
             }
@@ -750,31 +1242,9 @@ int main(
             );
         }
 
-        // ----------------------------------------------------
-        // Local Node Status
-        // ----------------------------------------------------
-
-        else if (
-            command == "STATUS" ||
-            command == "status"
-        ) {
-            node.status();
-        }
-
-        // ----------------------------------------------------
-        // Cluster Membership
-        // ----------------------------------------------------
-
-        else if (
-            command == "CLUSTER" ||
-            command == "cluster"
-        ) {
-            node.clusterStatus();
-        }
-
-        // ----------------------------------------------------
-        // Help
-        // ----------------------------------------------------
+        // ====================================================
+        // HELP
+        // ====================================================
 
         else if (
             command == "HELP" ||
@@ -783,9 +1253,9 @@ int main(
             printCommandHelp();
         }
 
-        // ----------------------------------------------------
-        // Exit
-        // ----------------------------------------------------
+        // ====================================================
+        // EXIT
+        // ====================================================
 
         else if (
             command == "EXIT" ||
@@ -797,14 +1267,9 @@ int main(
             break;
         }
 
-        // ----------------------------------------------------
-        // Unknown
-        // ----------------------------------------------------
-
         else {
             cout
-                << "Unknown command. "
-                << "Type HELP\n";
+                << "Unknown command. Type HELP\n";
         }
     }
 

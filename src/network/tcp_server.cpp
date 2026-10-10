@@ -1,6 +1,5 @@
 #include "tcp_server.h"
 
-#include <cstring>
 #include <iostream>
 #include <string>
 
@@ -19,12 +18,18 @@
 #include <unistd.h>
 
 #endif
+
+using namespace std;
+
 namespace {
-void closeSocket(SocketHandle socket) {
+
+void closeSocket(
+    SocketHandle socketHandle
+) {
 #ifdef _WIN32
-    closesocket(socket);
+    closesocket(socketHandle);
 #else
-    close(socket);
+    close(socketHandle);
 #endif
 }
 
@@ -47,16 +52,103 @@ void cleanupSockets() {
 #endif
 }
 
+bool sendAll(
+    SocketHandle socketHandle,
+    const string& data
+) {
+    size_t totalSent = 0;
+
+    while (totalSent < data.size()) {
+
+        int sent = send(
+            socketHandle,
+            data.data() + totalSent,
+            static_cast<int>(
+                data.size() - totalSent
+            ),
+            0
+        );
+
+        if (sent <= 0) {
+            return false;
+        }
+
+        totalSent +=
+            static_cast<size_t>(sent);
+    }
+
+    return true;
+}
+
+string receiveLine(
+    SocketHandle socketHandle
+) {
+    string request;
+
+    char buffer[1024];
+
+    constexpr size_t maxRequestSize =
+        64 * 1024;
+
+    while (
+        request.size() <
+        maxRequestSize
+    ) {
+        int received = recv(
+            socketHandle,
+            buffer,
+            sizeof(buffer),
+            0
+        );
+
+        if (received <= 0) {
+            break;
+        }
+
+        request.append(
+            buffer,
+            static_cast<size_t>(received)
+        );
+
+        size_t newline =
+            request.find('\n');
+
+        if (newline != string::npos) {
+            request.resize(newline);
+            break;
+        }
+    }
+
+    if (
+        !request.empty() &&
+        request.back() == '\r'
+    ) {
+        request.pop_back();
+    }
+
+    return request;
+}
+
 } // namespace
 
-TcpServer::TcpServer(const std::string& nodeId, int port)
+TcpServer::TcpServer(
+    const string& nodeId,
+    int port,
+    RequestHandler requestHandler
+)
     : nodeId(nodeId),
       port(port),
+      requestHandler(
+          std::move(requestHandler)
+      )
 #ifdef _WIN32
-      serverSocket(INVALID_SOCKET) {
+      ,
+      serverSocket(INVALID_SOCKET)
 #else
-      serverSocket(-1) {
+      ,
+      serverSocket(-1)
 #endif
+{
 }
 
 TcpServer::~TcpServer() {
@@ -69,23 +161,32 @@ bool TcpServer::start() {
     }
 
     if (!initializeSockets()) {
-        std::cerr << "Failed to initialize socket subsystem\n";
+        cerr
+            << "Failed to initialize sockets\n";
+
         return false;
     }
 
-    serverSocket = socket(
-        AF_INET,
-        SOCK_STREAM,
-        0
-    );
+    serverSocket =
+        socket(
+            AF_INET,
+            SOCK_STREAM,
+            0
+        );
 
 #ifdef _WIN32
-    if (serverSocket == INVALID_SOCKET) {
+    if (
+        serverSocket ==
+        INVALID_SOCKET
+    ) {
 #else
     if (serverSocket < 0) {
 #endif
-        std::cerr << "Failed to create server socket\n";
+        cerr
+            << "Failed to create server socket\n";
+
         cleanupSockets();
+
         return false;
     }
 
@@ -96,7 +197,9 @@ bool TcpServer::start() {
         serverSocket,
         SOL_SOCKET,
         SO_REUSEADDR,
-        reinterpret_cast<const char*>(&reuse),
+        reinterpret_cast<const char*>(
+            &reuse
+        ),
         sizeof(reuse)
     );
 #else
@@ -110,27 +213,54 @@ bool TcpServer::start() {
 #endif
 
     sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_ANY);
-    address.sin_port = htons(static_cast<unsigned short>(port));
 
-    if (bind(
+    address.sin_family =
+        AF_INET;
+
+    address.sin_addr.s_addr =
+        htonl(INADDR_ANY);
+
+    address.sin_port =
+        htons(
+            static_cast<unsigned short>(
+                port
+            )
+        );
+
+    if (
+        bind(
             serverSocket,
-            reinterpret_cast<sockaddr*>(&address),
-            sizeof(address)) < 0) {
-
-        std::cerr << "Failed to bind port " << port << '\n';
+            reinterpret_cast<sockaddr*>(
+                &address
+            ),
+            sizeof(address)
+        ) < 0
+    ) {
+        cerr
+            << "Failed to bind port "
+            << port
+            << '\n';
 
         closeSocket(serverSocket);
+
         cleanupSockets();
 
         return false;
     }
 
-    if (listen(serverSocket, 16) < 0) {
-        std::cerr << "Failed to listen on port " << port << '\n';
+    if (
+        listen(
+            serverSocket,
+            32
+        ) < 0
+    ) {
+        cerr
+            << "Failed to listen on port "
+            << port
+            << '\n';
 
         closeSocket(serverSocket);
+
         cleanupSockets();
 
         return false;
@@ -138,43 +268,59 @@ bool TcpServer::start() {
 
     running = true;
 
-    serverThread = std::thread(&TcpServer::run, this);
+    serverThread =
+        thread(
+            &TcpServer::run,
+            this
+        );
 
     return true;
 }
 
 void TcpServer::run() {
-    std::cout << "Network server listening on port "
-              << port << '\n';
+    cout
+        << "Network server listening on port "
+        << port
+        << '\n';
 
     while (running) {
+
         sockaddr_in clientAddress{};
 
 #ifdef _WIN32
-        int clientAddressLength = sizeof(clientAddress);
+        int clientAddressLength =
+            sizeof(clientAddress);
 #else
-        socklen_t clientAddressLength = sizeof(clientAddress);
+        socklen_t clientAddressLength =
+            sizeof(clientAddress);
 #endif
 
-        SocketHandle clientSocket = accept(
-            serverSocket,
-            reinterpret_cast<sockaddr*>(&clientAddress),
-            &clientAddressLength
-        );
+        SocketHandle clientSocket =
+            accept(
+                serverSocket,
+                reinterpret_cast<sockaddr*>(
+                    &clientAddress
+                ),
+                &clientAddressLength
+            );
 
 #ifdef _WIN32
-        if (clientSocket == INVALID_SOCKET) {
+        if (
+            clientSocket ==
+            INVALID_SOCKET
+        ) {
 #else
         if (clientSocket < 0) {
 #endif
             if (running) {
-                std::cerr << "Failed to accept connection\n";
+                cerr
+                    << "Failed to accept connection\n";
             }
 
             continue;
         }
 
-        std::thread(
+        thread(
             &TcpServer::handleClient,
             this,
             clientSocket
@@ -182,51 +328,47 @@ void TcpServer::run() {
     }
 }
 
-void TcpServer::handleClient(SocketHandle clientSocket) {
-    char buffer[1024]{};
+void TcpServer::handleClient(
+    SocketHandle clientSocket
+) {
+    string request =
+        receiveLine(clientSocket);
 
-    int received = recv(
-        clientSocket,
-        buffer,
-        sizeof(buffer) - 1,
-        0
-    );
-
-    if (received <= 0) {
+    if (request.empty()) {
         closeSocket(clientSocket);
         return;
     }
 
-    buffer[received] = '\0';
-
-    std::string request(buffer);
-
-    while (!request.empty() &&
-           (request.back() == '\n' ||
-            request.back() == '\r')) {
-        request.pop_back();
-    }
-
-    std::string response;
+    string response;
 
     if (request == "PING") {
-        response = "PONG " + nodeId + "\n";
-    }
-    else if (request == "INFO") {
         response =
-            "NODE_ID=" + nodeId +
-            " PORT=" + std::to_string(port) +
-            "\n";
-    }
-    else {
-        response = "ERROR UNKNOWN_COMMAND\n";
+            "PONG " + nodeId;
     }
 
-    send(
+    else if (request == "INFO") {
+        response =
+            "NODE_ID=" +
+            nodeId +
+            " PORT=" +
+            to_string(port);
+    }
+
+    else if (requestHandler) {
+        response =
+            requestHandler(request);
+    }
+
+    else {
+        response =
+            "ERROR UNKNOWN_COMMAND";
+    }
+
+    response += '\n';
+
+    sendAll(
         clientSocket,
-        response.c_str(),
-        static_cast<int>(response.size()),
-        0
+        response
     );
 
     closeSocket(clientSocket);
@@ -242,7 +384,8 @@ void TcpServer::stop() {
     closeSocket(serverSocket);
 
 #ifdef _WIN32
-    serverSocket = INVALID_SOCKET;
+    serverSocket =
+        INVALID_SOCKET;
 #else
     serverSocket = -1;
 #endif

@@ -1,6 +1,5 @@
 #include "tcp_client.h"
 
-#include <iostream>
 #include <string>
 
 #ifdef _WIN32
@@ -13,12 +12,12 @@
 #else
 
 #include <arpa/inet.h>
-#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #endif
+using namespace std;
 
 namespace {
 
@@ -28,11 +27,13 @@ using SocketHandle = SOCKET;
 using SocketHandle = int;
 #endif
 
-void closeSocket(SocketHandle socket) {
+void closeSocket(
+    SocketHandle socketHandle
+) {
 #ifdef _WIN32
-    closesocket(socket);
+    closesocket(socketHandle);
 #else
-    close(socket);
+    close(socketHandle);
 #endif
 }
 
@@ -55,97 +56,77 @@ void cleanupSockets() {
 #endif
 }
 
-std::string sendRequest(
-    const std::string& host,
-    int port,
-    const std::string& request
+bool sendAll(
+    SocketHandle socketHandle,
+    const string& data
 ) {
-    if (!initializeSockets()) {
-        return "ERROR SOCKET_INIT";
-    }
+    size_t totalSent = 0;
 
-    SocketHandle socketHandle = socket(
-        AF_INET,
-        SOCK_STREAM,
-        0
-    );
+    while (totalSent < data.size()) {
 
-#ifdef _WIN32
-    if (socketHandle == INVALID_SOCKET) {
-#else
-    if (socketHandle < 0) {
-#endif
-        cleanupSockets();
-        return "ERROR SOCKET_CREATE";
-    }
-
-    sockaddr_in serverAddress{};
-
-    serverAddress.sin_family = AF_INET;
-    serverAddress.sin_port =
-        htons(static_cast<unsigned short>(port));
-
-    if (inet_pton(
-            AF_INET,
-            host.c_str(),
-            &serverAddress.sin_addr) <= 0) {
-
-        closeSocket(socketHandle);
-        cleanupSockets();
-
-        return "ERROR INVALID_ADDRESS";
-    }
-
-    if (connect(
+        int sent = send(
             socketHandle,
-            reinterpret_cast<sockaddr*>(&serverAddress),
-            sizeof(serverAddress)) < 0) {
+            data.data() + totalSent,
+            static_cast<int>(
+                data.size() - totalSent
+            ),
+            0
+        );
 
-        closeSocket(socketHandle);
-        cleanupSockets();
+        if (sent <= 0) {
+            return false;
+        }
 
-        return "ERROR CONNECTION_FAILED";
+        totalSent +=
+            static_cast<size_t>(sent);
     }
 
-    std::string requestWithNewline = request + "\n";
+    return true;
+}
 
-    int sent = send(
-        socketHandle,
-        requestWithNewline.c_str(),
-        static_cast<int>(requestWithNewline.size()),
-        0
-    );
+string receiveLine(
+    SocketHandle socketHandle
+) {
+    string response;
 
-    if (sent <= 0) {
-        closeSocket(socketHandle);
-        cleanupSockets();
+    char buffer[1024];
 
-        return "ERROR SEND_FAILED";
+    constexpr size_t maxResponseSize =
+        64 * 1024;
+
+    while (
+        response.size() <
+        maxResponseSize
+    ) {
+        int received = recv(
+            socketHandle,
+            buffer,
+            sizeof(buffer),
+            0
+        );
+
+        if (received <= 0) {
+            break;
+        }
+
+        response.append(
+            buffer,
+            static_cast<size_t>(received)
+        );
+
+        size_t newline =
+            response.find('\n');
+
+        if (newline != string::npos) {
+            response.resize(newline);
+            break;
+        }
     }
 
-    char buffer[1024]{};
-
-    int received = recv(
-        socketHandle,
-        buffer,
-        sizeof(buffer) - 1,
-        0
-    );
-
-    closeSocket(socketHandle);
-    cleanupSockets();
-
-    if (received <= 0) {
-        return "ERROR RECEIVE_FAILED";
-    }
-
-    buffer[received] = '\0';
-
-    std::string response(buffer);
-
-    while (!response.empty() &&
-           (response.back() == '\n' ||
-            response.back() == '\r')) {
+    if (
+        !response.empty() &&
+        response.back() == '\r'
+    ) {
         response.pop_back();
     }
 
@@ -154,16 +135,122 @@ std::string sendRequest(
 
 } // namespace
 
-std::string TcpClient::ping(
-    const std::string& host,
-    int port
+string TcpClient::request(
+    const string& host,
+    int port,
+    const string& requestText
 ) {
-    return sendRequest(host, port, "PING");
+    if (!initializeSockets()) {
+        return "ERROR SOCKET_INIT";
+    }
+
+    SocketHandle socketHandle =
+        socket(
+            AF_INET,
+            SOCK_STREAM,
+            0
+        );
+
+#ifdef _WIN32
+    if (socketHandle == INVALID_SOCKET) {
+#else
+    if (socketHandle < 0) {
+#endif
+        cleanupSockets();
+
+        return "ERROR SOCKET_CREATE";
+    }
+
+    sockaddr_in serverAddress{};
+
+    serverAddress.sin_family =
+        AF_INET;
+
+    serverAddress.sin_port =
+        htons(
+            static_cast<unsigned short>(
+                port
+            )
+        );
+
+    if (
+        inet_pton(
+            AF_INET,
+            host.c_str(),
+            &serverAddress.sin_addr
+        ) <= 0
+    ) {
+        closeSocket(socketHandle);
+
+        cleanupSockets();
+
+        return "ERROR INVALID_ADDRESS";
+    }
+
+    if (
+        connect(
+            socketHandle,
+            reinterpret_cast<sockaddr*>(
+                &serverAddress
+            ),
+            sizeof(serverAddress)
+        ) < 0
+    ) {
+        closeSocket(socketHandle);
+
+        cleanupSockets();
+
+        return "ERROR CONNECTION_FAILED";
+    }
+
+    string payload =
+        requestText + "\n";
+
+    if (
+        !sendAll(
+            socketHandle,
+            payload
+        )
+    ) {
+        closeSocket(socketHandle);
+
+        cleanupSockets();
+
+        return "ERROR SEND_FAILED";
+    }
+
+    string response =
+        receiveLine(socketHandle);
+
+    closeSocket(socketHandle);
+
+    cleanupSockets();
+
+    if (response.empty()) {
+        return "ERROR RECEIVE_FAILED";
+    }
+
+    return response;
 }
 
-std::string TcpClient::info(
-    const std::string& host,
+string TcpClient::ping(
+    const string& host,
     int port
 ) {
-    return sendRequest(host, port, "INFO");
+    return request(
+        host,
+        port,
+        "PING"
+    );
+}
+
+string TcpClient::info(
+    const string& host,
+    int port
+) {
+    return request(
+        host,
+        port,
+        "INFO"
+    );
 }
