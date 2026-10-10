@@ -14,6 +14,7 @@ add_executable(hydra
     src/main.cpp
     src/network/tcp_server.cpp
     src/network/tcp_client.cpp
+    src/cluster/cluster_manager.cpp
 )
 
 target_include_directories(hydra PRIVATE
