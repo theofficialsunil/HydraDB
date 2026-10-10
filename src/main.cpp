@@ -2,6 +2,8 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include "network/tcp_client.h"
+#include "network/tcp_server.h"
 
 using namespace std;
 
@@ -51,11 +53,19 @@ private:
     StorageEngine storage;
     string state = "STARTING";
 
+    TcpServer networkServer;
+
 public:
     explicit HydraNode(const NodeConfig& nodeConfig)
-        : config(nodeConfig) {}
+        : config(nodeConfig),
+          networkServer(nodeConfig.nodeId, nodeConfig.port) {}
 
-    void start() {
+    bool start() {
+        if (!networkServer.start()) {
+            state = "FAILED";
+            return false;
+        }
+
         state = "RUNNING";
 
         cout << "=================================\n";
@@ -65,8 +75,11 @@ public:
         cout << "Address:  " << config.host << ':' << config.port << '\n';
         cout << "State:    " << state << '\n';
         cout << "Storage:  In-memory\n";
+        cout << "Network:  TCP\n";
         cout << "=================================\n";
         cout << "Type HELP for commands\n\n";
+
+        return true;
     }
 
     void status() const {
@@ -75,8 +88,13 @@ public:
         cout << "Node ID:  " << config.nodeId << '\n';
         cout << "Address:  " << config.host << ':' << config.port << '\n';
         cout << "State:    " << state << '\n';
+
+        cout << "Network:  "
+             << (networkServer.isRunning() ? "RUNNING" : "STOPPED")
+             << '\n';
+
         cout << "Records:  " << storage.size() << '\n';
-        cout << "Storage:  In-memory\n";
+        cout << "Storage:  In-memory\n\n";
     }
 
     void put(const string& key, const string& value) {
@@ -90,9 +108,31 @@ public:
     void erase(const string& key) {
         storage.erase(key);
     }
+
+    void pingNode(const string& host, int port) const {
+        cout << "PING "
+             << host
+             << ':'
+             << port
+             << " ... ";
+
+        string response = TcpClient::ping(host, port);
+
+        cout << response << '\n';
+    }
+
+    void infoNode(const string& host, int port) const {
+        string response = TcpClient::info(host, port);
+
+        cout << response << '\n';
+    }
 };
 
-bool parseArguments(int argc, char* argv[], NodeConfig& config) {
+bool parseArguments(
+    int argc,
+    char* argv[],
+    NodeConfig& config
+) {
     for (int i = 1; i < argc; ++i) {
         string argument = argv[i];
 
@@ -131,23 +171,50 @@ bool parseArguments(int argc, char* argv[], NodeConfig& config) {
                 return false;
             }
         }
-        else if (argument == "--help" || argument == "-h") {
+        else if (argument == "--help" ||
+                 argument == "-h") {
+
             cout << "HydraDB Node\n\n";
+
             cout << "Usage:\n";
-            cout << "  hydra --node-id <id> --host <host> --port <port>\n\n";
+            cout << "  hydra "
+                 << "--node-id <id> "
+                 << "--host <host> "
+                 << "--port <port>\n\n";
+
             cout << "Options:\n";
             cout << "  --node-id <id>    Node identifier\n";
             cout << "  --host <host>     Node host address\n";
-            cout << "  --port <port>     Node port\n";
+            cout << "  --port <port>     Node TCP port\n";
+
             return false;
         }
         else {
-            cerr << "Unknown argument: " << argument << '\n';
+            cerr << "Unknown argument: "
+                 << argument
+                 << '\n';
+
             return false;
         }
     }
 
     return true;
+}
+
+void printHelp() {
+    cout << "\nCommands\n";
+    cout << "-----------------------------\n";
+
+    cout << "PUT <key> <value>\n";
+    cout << "GET <key>\n";
+    cout << "DELETE <key>\n";
+
+    cout << "PING <host> <port>\n";
+    cout << "INFO <host> <port>\n";
+
+    cout << "STATUS\n";
+    cout << "HELP\n";
+    cout << "EXIT\n\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -158,7 +225,11 @@ int main(int argc, char* argv[]) {
     }
 
     HydraNode node(config);
-    node.start();
+
+    if (!node.start()) {
+        cerr << "Failed to start HydraDB node\n";
+        return 1;
+    }
 
     string line;
 
@@ -172,17 +243,24 @@ int main(int argc, char* argv[]) {
         istringstream input(line);
 
         string command;
-        string key;
-
         input >> command;
 
-        if (command == "PUT" || command == "put") {
+        if (command.empty()) {
+            continue;
+        }
+
+        if (command == "PUT" ||
+            command == "put") {
+
+            string key;
+
             if (!(input >> key)) {
                 cout << "Usage: PUT <key> <value>\n";
                 continue;
             }
 
             string value;
+
             getline(input >> ws, value);
 
             if (value.empty()) {
@@ -192,7 +270,12 @@ int main(int argc, char* argv[]) {
 
             node.put(key, value);
         }
-        else if (command == "GET" || command == "get") {
+
+        else if (command == "GET" ||
+                 command == "get") {
+
+            string key;
+
             if (!(input >> key)) {
                 cout << "Usage: GET <key>\n";
                 continue;
@@ -200,7 +283,12 @@ int main(int argc, char* argv[]) {
 
             node.get(key);
         }
-        else if (command == "DELETE" || command == "delete") {
+
+        else if (command == "DELETE" ||
+                 command == "delete") {
+
+            string key;
+
             if (!(input >> key)) {
                 cout << "Usage: DELETE <key>\n";
                 continue;
@@ -208,23 +296,65 @@ int main(int argc, char* argv[]) {
 
             node.erase(key);
         }
-        else if (command == "STATUS" || command == "status") {
+
+        else if (command == "PING" ||
+                 command == "ping") {
+
+            string host;
+            int port;
+
+            if (!(input >> host >> port)) {
+                cout << "Usage: PING <host> <port>\n";
+                continue;
+            }
+
+            if (port < 1 || port > 65535) {
+                cout << "Invalid port\n";
+                continue;
+            }
+
+            node.pingNode(host, port);
+        }
+
+        else if (command == "INFO" ||
+                 command == "info") {
+
+            string host;
+            int port;
+
+            if (!(input >> host >> port)) {
+                cout << "Usage: INFO <host> <port>\n";
+                continue;
+            }
+
+            if (port < 1 || port > 65535) {
+                cout << "Invalid port\n";
+                continue;
+            }
+
+            node.infoNode(host, port);
+        }
+
+        else if (command == "STATUS" ||
+                 command == "status") {
+
             node.status();
         }
-        else if (command == "HELP" || command == "help") {
-            cout << "\nCommands:\n";
-            cout << "  PUT <key> <value>\n";
-            cout << "  GET <key>\n";
-            cout << "  DELETE <key>\n";
-            cout << "  STATUS\n";
-            cout << "  HELP\n";
-            cout << "  EXIT\n\n";
+
+        else if (command == "HELP" ||
+                 command == "help") {
+
+            printHelp();
         }
-        else if (command == "EXIT" || command == "exit") {
+
+        else if (command == "EXIT" ||
+                 command == "exit") {
+
             cout << "Shutting down HydraDB node\n";
             break;
         }
-        else if (!command.empty()) {
+
+        else {
             cout << "Unknown command. Type HELP\n";
         }
     }

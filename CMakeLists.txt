@@ -12,6 +12,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_executable(hydra
     src/main.cpp
+    src/network/tcp_server.cpp
+    src/network/tcp_client.cpp
+)
+
+target_include_directories(hydra PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 target_compile_options(hydra PRIVATE
@@ -19,3 +25,7 @@ target_compile_options(hydra PRIVATE
     -Wextra
     -Wpedantic
 )
+
+if(WIN32)
+    target_link_libraries(hydra PRIVATE ws2_32)
+endif()
