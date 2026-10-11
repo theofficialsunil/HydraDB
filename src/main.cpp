@@ -9,73 +9,64 @@
 #include "cluster/cluster_manager.h"
 #include "network/tcp_client.h"
 #include "network/tcp_server.h"
+#include "raft/raft_node.h"
 #include "sharding/shard_manager.h"
 
 using namespace std;
 
 // ============================================================
-// Configuration
+// Node Configuration
 // ============================================================
 
 struct NodeConfig {
-    string nodeId =
-        "node-1";
+    string nodeId = "node-1";
+    string host = "127.0.0.1";
+    int port = 5001;
 
-    string host =
-        "127.0.0.1";
-
-    int port =
-        5001;
-
-    vector<PeerConfig>
-        peers;
+    vector<PeerConfig> peers;
 };
 
 // ============================================================
-// Temporary Local Storage
+// Temporary Local Storage Engine
+//
+// Later:
+//
+// WAL
+//   ↓
+// MemTable
+//   ↓
+// SSTables
 // ============================================================
 
 class StorageEngine {
 private:
-    unordered_map<
-        string,
-        string
-    > data;
+    unordered_map<string, string> data;
 
-    mutable mutex
-        dataMutex;
+    mutable mutex dataMutex;
 
 public:
     void put(
         const string& key,
         const string& value
     ) {
-        lock_guard<mutex>
-            lock(dataMutex);
+        lock_guard<mutex> lock(dataMutex);
 
-        data[key] =
-            value;
+        data[key] = value;
     }
 
     bool get(
         const string& key,
         string& value
     ) const {
-        lock_guard<mutex>
-            lock(dataMutex);
+        lock_guard<mutex> lock(dataMutex);
 
-        auto it =
-            data.find(key);
+        auto it = data.find(key);
 
-        if (
-            it ==
-            data.end()
-        ) {
+        if (it == data.end()) {
             return false;
         }
 
-        value =
-            it->second;
+        value = it->second;
 
         return true;
     }
@@ -83,33 +74,26 @@ public:
     bool erase(
         const string& key
     ) {
-        lock_guard<mutex>
-            lock(dataMutex);
+        lock_guard<mutex> lock(dataMutex);
 
-        return
-            data.erase(key) >
-            0;
+        return data.erase(key) > 0;
     }
 
     size_t size() const {
-        lock_guard<mutex>
-            lock(dataMutex);
+        lock_guard<mutex> lock(dataMutex);
 
-        return
-            data.size();
+        return data.size();
     }
 };
 
 // ============================================================
-// Build Cluster Node List
+// Build Shard Node List
 // ============================================================
 
-vector<ShardNode>
-buildShardNodes(
+vector<ShardNode> buildShardNodes(
     const NodeConfig& config
 ) {
-    vector<ShardNode>
-        nodes;
+    vector<ShardNode> nodes;
 
     nodes.push_back(
         {
@@ -119,10 +103,7 @@ buildShardNodes(
         }
     );
 
-    for (
-        const auto& peer :
-        config.peers
-    ) {
+    for (const auto& peer : config.peers) {
         nodes.push_back(
             {
                 peer.nodeId,
@@ -145,20 +126,28 @@ private:
 
     StorageEngine storage;
 
-    string state =
-        "STARTING";
+    string state = "STARTING";
 
-    ShardManager
-        shardManager;
+    // --------------------------------------------------------
+    // Distributed components
+    // --------------------------------------------------------
 
-    TcpServer
-        networkServer;
+    ShardManager shardManager;
 
-    ClusterManager
-        clusterManager;
+    TcpServer networkServer;
+
+    ClusterManager clusterManager;
+
+    RaftNode raftNode;
 
     // ========================================================
-    // Send write to replica nodes
+    // Replicate PUT to follower replicas
+    //
+    // IMPORTANT:
+    // This is still our Step-5 replication mechanism.
+    //
+    // Raft is currently used only for leader election.
+    // In the next step, writes will go through the Raft log.
     // ========================================================
 
     size_t replicatePut(
@@ -166,15 +155,13 @@ private:
         const string& key,
         const string& value
     ) {
-        vector<ShardNode>
-            replicas =
-                shardManager
-                    .replicasForShard(
-                        shardId
-                    );
+        vector<ShardNode> replicas =
+            shardManager.replicasForShard(
+                shardId
+            );
 
-        size_t acknowledgements =
-            1;
+        // Primary has already stored the value locally.
+        size_t acknowledgements = 1;
 
         for (
             size_t i = 1;
@@ -186,9 +173,7 @@ private:
 
             string request =
                 "REPLICA_PUT " +
-                to_string(
-                    shardId
-                ) +
+                to_string(shardId) +
                 " " +
                 key +
                 " " +
@@ -221,22 +206,20 @@ private:
     }
 
     // ========================================================
-    // Replicate delete
+    // Replicate DELETE
     // ========================================================
 
     size_t replicateDelete(
         size_t shardId,
         const string& key
     ) {
-        vector<ShardNode>
-            replicas =
-                shardManager
-                    .replicasForShard(
-                        shardId
-                    );
+        vector<ShardNode> replicas =
+            shardManager.replicasForShard(
+                shardId
+            );
 
-        size_t acknowledgements =
-            1;
+        // Primary operation counts as one acknowledgement.
+        size_t acknowledgements = 1;
 
         for (
             size_t i = 1;
@@ -248,9 +231,7 @@ private:
 
             string request =
                 "REPLICA_DELETE " +
-                to_string(
-                    shardId
-                ) +
+                to_string(shardId) +
                 " " +
                 key;
 
@@ -283,21 +264,52 @@ private:
     }
 
     // ========================================================
-    // Handle internal network messages
+    // Handle Internal Network Request
     // ========================================================
 
     string handleNetworkRequest(
         const string& request
     ) {
-        istringstream
-            input(request);
+        // ----------------------------------------------------
+        // Raft RPCs
+        //
+        // Examples:
+        //
+        // RAFT_REQUEST_VOTE
+        // RAFT_HEARTBEAT
+        //
+        // Let RaftNode handle all RAFT_* traffic.
+        // ----------------------------------------------------
+
+        if (
+            request.rfind(
+                "RAFT_",
+                0
+            ) == 0
+        ) {
+            return raftNode.handleRequest(
+                request
+            );
+        }
+
+        // ----------------------------------------------------
+        // Existing data-plane messages
+        // ----------------------------------------------------
+
+        istringstream input(request);
 
         string command;
 
         input >> command;
 
         // ====================================================
-        // Distributed PUT received by primary
+        // KVPUT
+        //
+        // A request routed to this shard's fixed primary.
+        //
+        // NOTE:
+        // Fixed primary is still used for DATA in this step.
+        // Raft leader is not yet controlling writes.
         // ====================================================
 
         if (
@@ -318,24 +330,20 @@ private:
                 value
             );
 
-            if (
-                value.empty()
-            ) {
+            if (value.empty()) {
                 return
                     "ERROR INVALID_KVPUT";
             }
 
             size_t shardId =
-                shardManager
-                    .shardForKey(
-                        key
-                    );
+                shardManager.shardForKey(
+                    key
+                );
 
             ShardNode primary =
-                shardManager
-                    .primaryForShard(
-                        shardId
-                    );
+                shardManager.primaryForShard(
+                    shardId
+                );
 
             if (
                 primary.nodeId !=
@@ -364,7 +372,7 @@ private:
 
             size_t quorum =
                 replicationFactor /
-                2 +
+                    2 +
                 1;
 
             if (
@@ -398,7 +406,7 @@ private:
         }
 
         // ====================================================
-        // Replica PUT
+        // REPLICA_PUT
         // ====================================================
 
         if (
@@ -425,9 +433,7 @@ private:
                 value
             );
 
-            if (
-                value.empty()
-            ) {
+            if (value.empty()) {
                 return
                     "ERROR INVALID_REPLICA_PUT";
             }
@@ -453,7 +459,7 @@ private:
         }
 
         // ====================================================
-        // Primary GET
+        // KVGET
         // ====================================================
 
         if (
@@ -468,16 +474,14 @@ private:
             }
 
             size_t shardId =
-                shardManager
-                    .shardForKey(
-                        key
-                    );
+                shardManager.shardForKey(
+                    key
+                );
 
             ShardNode primary =
-                shardManager
-                    .primaryForShard(
-                        shardId
-                    );
+                shardManager.primaryForShard(
+                    shardId
+                );
 
             if (
                 primary.nodeId !=
@@ -506,7 +510,7 @@ private:
         }
 
         // ====================================================
-        // Replica GET
+        // REPLICA_GET
         // ====================================================
 
         if (
@@ -555,7 +559,7 @@ private:
         }
 
         // ====================================================
-        // Primary DELETE
+        // KVDELETE
         // ====================================================
 
         if (
@@ -570,16 +574,14 @@ private:
             }
 
             size_t shardId =
-                shardManager
-                    .shardForKey(
-                        key
-                    );
+                shardManager.shardForKey(
+                    key
+                );
 
             ShardNode primary =
-                shardManager
-                    .primaryForShard(
-                        shardId
-                    );
+                shardManager.primaryForShard(
+                    shardId
+                );
 
             if (
                 primary.nodeId !=
@@ -607,7 +609,7 @@ private:
 
             size_t quorum =
                 replicationFactor /
-                2 +
+                    2 +
                 1;
 
             if (
@@ -635,7 +637,7 @@ private:
         }
 
         // ====================================================
-        // Replica DELETE
+        // REPLICA_DELETE
         // ====================================================
 
         if (
@@ -685,12 +687,14 @@ private:
     }
 
 public:
+    // ========================================================
+    // Constructor
+    // ========================================================
+
     explicit HydraNode(
         const NodeConfig& nodeConfig
     )
-        : config(
-              nodeConfig
-          ),
+        : config(nodeConfig),
 
           shardManager(
               buildShardNodes(
@@ -717,14 +721,37 @@ public:
           clusterManager(
               nodeConfig.nodeId,
               nodeConfig.peers
+          ),
+
+          raftNode(
+              nodeConfig.nodeId,
+              nodeConfig.peers
           ) {
     }
 
     // ========================================================
-    // Start node
+    // Destructor
+    //
+    // Explicitly stop background services before member
+    // destruction begins.
+    // ========================================================
+
+    ~HydraNode() {
+        raftNode.stop();
+
+        clusterManager.stop();
+
+        networkServer.stop();
+    }
+
+    // ========================================================
+    // Start Node
     // ========================================================
 
     bool start() {
+        // Network must start first because both cluster
+        // heartbeats and Raft depend on TCP communication.
+
         if (
             !networkServer.start()
         ) {
@@ -734,7 +761,11 @@ public:
             return false;
         }
 
+        // Cluster health monitoring.
         clusterManager.start();
+
+        // Raft leader election.
+        raftNode.start();
 
         state =
             "RUNNING";
@@ -790,6 +821,9 @@ public:
             << '\n';
 
         cout
+            << "Raft:         Election enabled\n";
+
+        cout
             << "=================================\n";
 
         cout
@@ -807,16 +841,18 @@ public:
         const string& value
     ) {
         size_t shardId =
-            shardManager
-                .shardForKey(
-                    key
-                );
+            shardManager.shardForKey(
+                key
+            );
 
         ShardNode primary =
-            shardManager
-                .primaryForShard(
-                    shardId
-                );
+            shardManager.primaryForShard(
+                shardId
+            );
+
+        // ----------------------------------------------------
+        // Local fixed shard primary
+        // ----------------------------------------------------
 
         if (
             primary.nodeId ==
@@ -840,7 +876,7 @@ public:
 
             size_t quorum =
                 replicationFactor /
-                2 +
+                    2 +
                 1;
 
             cout
@@ -875,6 +911,10 @@ public:
             return;
         }
 
+        // ----------------------------------------------------
+        // Route to fixed primary
+        // ----------------------------------------------------
+
         string response =
             TcpClient::request(
                 primary.host,
@@ -906,16 +946,14 @@ public:
         const string& key
     ) const {
         size_t shardId =
-            shardManager
-                .shardForKey(
-                    key
-                );
+            shardManager.shardForKey(
+                key
+            );
 
         vector<ShardNode> replicas =
-            shardManager
-                .replicasForShard(
-                    shardId
-                );
+            shardManager.replicasForShard(
+                shardId
+            );
 
         const ShardNode& primary =
             replicas[0];
@@ -949,13 +987,14 @@ public:
         }
 
         // ----------------------------------------------------
-        // Try primary
+        // First try primary
         // ----------------------------------------------------
 
         string response =
             TcpClient::request(
                 primary.host,
                 primary.port,
+
                 "KVGET " +
                     key
             );
@@ -990,15 +1029,16 @@ public:
             return;
         }
 
+        // ----------------------------------------------------
+        // Primary unavailable.
+        // Try replicas.
+        // ----------------------------------------------------
+
         cout
             << "Primary "
             << primary.nodeId
             << " unavailable, "
             << "trying replicas...\n";
-
-        // ----------------------------------------------------
-        // Read fallback
-        // ----------------------------------------------------
 
         for (
             size_t i = 1;
@@ -1008,7 +1048,10 @@ public:
             const auto& replica =
                 replicas[i];
 
-            // Local replica.
+            // ----------------------------------------------
+            // Local replica
+            // ----------------------------------------------
+
             if (
                 replica.nodeId ==
                 config.nodeId
@@ -1035,6 +1078,10 @@ public:
 
                 continue;
             }
+
+            // ----------------------------------------------
+            // Remote replica
+            // ----------------------------------------------
 
             string replicaResponse =
                 TcpClient::request(
@@ -1075,23 +1122,21 @@ public:
     }
 
     // ========================================================
-    // DELETE
+    // Distributed DELETE
     // ========================================================
 
     void erase(
         const string& key
     ) {
         size_t shardId =
-            shardManager
-                .shardForKey(
-                    key
-                );
+            shardManager.shardForKey(
+                key
+            );
 
         ShardNode primary =
-            shardManager
-                .primaryForShard(
-                    shardId
-                );
+            shardManager.primaryForShard(
+                shardId
+            );
 
         if (
             primary.nodeId ==
@@ -1114,7 +1159,7 @@ public:
 
             size_t quorum =
                 replicationFactor /
-                2 +
+                    2 +
                 1;
 
             if (
@@ -1162,7 +1207,7 @@ public:
     }
 
     // ========================================================
-    // Diagnostics
+    // Local Node Status
     // ========================================================
 
     void status() const {
@@ -1173,72 +1218,125 @@ public:
             << "---------------------------------\n";
 
         cout
-            << "Node ID:       "
+            << "Node ID:        "
             << config.nodeId
             << '\n';
 
         cout
-            << "Address:       "
+            << "Address:        "
             << config.host
             << ':'
             << config.port
             << '\n';
 
         cout
-            << "State:         "
+            << "State:          "
             << state
             << '\n';
 
         cout
-            << "Network:       "
+            << "Network:        "
             << (
                 networkServer
                     .isRunning()
-                ? "RUNNING"
-                : "STOPPED"
+                    ? "RUNNING"
+                    : "STOPPED"
             )
             << '\n';
 
         cout
-            << "Peers:         "
+            << "Peers:          "
             << clusterManager
                    .peerCount()
             << '\n';
 
         cout
-            << "Virtual shards:"
-            << ' '
+            << "Virtual shards: "
             << shardManager
                    .getShardCount()
             << '\n';
 
         cout
-            << "Replication:   "
+            << "Replication:    "
             << shardManager
                    .getReplicationFactor()
             << '\n';
 
         cout
-            << "Local records: "
+            << "Local records:  "
             << storage.size()
             << '\n';
 
         cout
-            << "Storage:       In-memory\n\n";
+            << "Raft role:      ";
+
+        if (
+            raftNode.getRole() ==
+            RaftRole::LEADER
+        ) {
+            cout << "LEADER";
+        }
+        else if (
+            raftNode.getRole() ==
+            RaftRole::CANDIDATE
+        ) {
+            cout << "CANDIDATE";
+        }
+        else {
+            cout << "FOLLOWER";
+        }
+
+        cout << '\n';
+
+        cout
+            << "Raft term:      "
+            << raftNode
+                   .getCurrentTerm()
+            << '\n';
+
+        string leaderId =
+            raftNode.getLeaderId();
+
+        cout
+            << "Raft leader:    "
+            << (
+                leaderId.empty()
+                    ? "UNKNOWN"
+                    : leaderId
+            )
+            << '\n';
+
+        cout
+            << "Storage:        In-memory\n\n";
     }
+
+    // ========================================================
+    // Cluster Status
+    // ========================================================
 
     void clusterStatus() const {
         clusterManager
             .printClusterStatus();
     }
 
+    // ========================================================
+    // Raft Status
+    // ========================================================
+
+    void raftStatus() const {
+        raftNode.printStatus();
+    }
+
+    // ========================================================
+    // Sharding Diagnostics
+    // ========================================================
+
     void route(
         const string& key
     ) const {
-        shardManager
-            .printRoute(
-                key
-            );
+        shardManager.printRoute(
+            key
+        );
     }
 
     void replicas(
@@ -1254,6 +1352,10 @@ public:
         shardManager
             .printDistribution();
     }
+
+    // ========================================================
+    // Networking Diagnostics
+    // ========================================================
 
     void pingNode(
         const string& host,
@@ -1288,7 +1390,11 @@ public:
 };
 
 // ============================================================
-// Peer parser
+// Peer Parser
+//
+// Format:
+//
+// node-2@127.0.0.1:5002
 // ============================================================
 
 bool parsePeer(
@@ -1347,9 +1453,7 @@ bool parsePeer(
 
     try {
         peer.port =
-            stoi(
-                portValue
-            );
+            stoi(portValue);
     }
     catch (...) {
         return false;
@@ -1361,7 +1465,7 @@ bool parsePeer(
 }
 
 // ============================================================
-// Program help
+// Program Help
 // ============================================================
 
 void printProgramHelp() {
@@ -1377,10 +1481,28 @@ void printProgramHelp() {
         << "--host <host> "
         << "--port <port> "
         << "[--peer <id@host:port> ...]\n\n";
+
+    cout
+        << "Options:\n";
+
+    cout
+        << "  --node-id <id>\n";
+
+    cout
+        << "  --host <host>\n";
+
+    cout
+        << "  --port <port>\n";
+
+    cout
+        << "  --peer <id@host:port>\n";
+
+    cout
+        << "  --help, -h\n";
 }
 
 // ============================================================
-// Arguments
+// Argument Parsing
 // ============================================================
 
 bool parseArguments(
@@ -1395,6 +1517,10 @@ bool parseArguments(
     ) {
         string argument =
             argv[i];
+
+        // ----------------------------------------------------
+        // Node ID
+        // ----------------------------------------------------
 
         if (
             argument ==
@@ -1413,6 +1539,10 @@ bool parseArguments(
                 argv[++i];
         }
 
+        // ----------------------------------------------------
+        // Host
+        // ----------------------------------------------------
+
         else if (
             argument ==
             "--host"
@@ -1429,6 +1559,10 @@ bool parseArguments(
             config.host =
                 argv[++i];
         }
+
+        // ----------------------------------------------------
+        // Port
+        // ----------------------------------------------------
 
         else if (
             argument ==
@@ -1461,11 +1595,16 @@ bool parseArguments(
                 config.port > 65535
             ) {
                 cerr
-                    << "Invalid port\n";
+                    << "Port must be between "
+                    << "1 and 65535\n";
 
                 return false;
             }
         }
+
+        // ----------------------------------------------------
+        // Peer
+        // ----------------------------------------------------
 
         else if (
             argument ==
@@ -1496,25 +1635,21 @@ bool parseArguments(
                     << peerValue
                     << '\n';
 
-                return false;
-            }
-
-            if (
-                peer.nodeId ==
-                config.nodeId
-            ) {
                 cerr
-                    << "Cannot add local node "
-                    << "as peer\n";
+                    << "Expected: "
+                    << "node-id@host:port\n";
 
                 return false;
             }
 
-            config.peers
-                .push_back(
-                    peer
-                );
+            config.peers.push_back(
+                peer
+            );
         }
+
+        // ----------------------------------------------------
+        // Help
+        // ----------------------------------------------------
 
         else if (
             argument ==
@@ -1527,6 +1662,10 @@ bool parseArguments(
             exit(0);
         }
 
+        // ----------------------------------------------------
+        // Unknown
+        // ----------------------------------------------------
+
         else {
             cerr
                 << "Unknown argument: "
@@ -1537,11 +1676,33 @@ bool parseArguments(
         }
     }
 
+    // ========================================================
+    // Validate peer configuration after parsing everything.
+    // ========================================================
+
+    for (
+        const auto& peer :
+        config.peers
+    ) {
+        if (
+            peer.nodeId ==
+            config.nodeId
+        ) {
+            cerr
+                << "Cannot add local node "
+                << "as its own peer: "
+                << peer.nodeId
+                << '\n';
+
+            return false;
+        }
+    }
+
     return true;
 }
 
 // ============================================================
-// CLI help
+// CLI Help
 // ============================================================
 
 void printCommandHelp() {
@@ -1571,6 +1732,9 @@ void printCommandHelp() {
 
     cout
         << "CLUSTER\n";
+
+    cout
+        << "RAFT\n";
 
     cout
         << "STATUS\n";
@@ -1624,7 +1788,6 @@ int main(
     string line;
 
     while (true) {
-
         cout
             << "hydra> ";
 
@@ -1637,8 +1800,9 @@ int main(
             break;
         }
 
-        istringstream
-            input(line);
+        istringstream input(
+            line
+        );
 
         string command;
 
@@ -1658,7 +1822,8 @@ int main(
 
             if (!(input >> key)) {
                 cout
-                    << "Usage: PUT <key> <value>\n";
+                    << "Usage: "
+                    << "PUT <key> <value>\n";
 
                 continue;
             }
@@ -1674,7 +1839,8 @@ int main(
                 value.empty()
             ) {
                 cout
-                    << "Usage: PUT <key> <value>\n";
+                    << "Usage: "
+                    << "PUT <key> <value>\n";
 
                 continue;
             }
@@ -1720,7 +1886,6 @@ int main(
                 key
             );
         }
-
         else if (
             command == "ROUTE" ||
             command == "route"
@@ -1738,7 +1903,6 @@ int main(
                 key
             );
         }
-
         else if (
             command == "REPLICAS" ||
             command == "replicas"
@@ -1772,6 +1936,13 @@ int main(
         }
 
         else if (
+            command == "RAFT" ||
+            command == "raft"
+        ) {
+            node.raftStatus();
+        }
+
+        else if (
             command == "STATUS" ||
             command == "status"
         ) {
@@ -1792,7 +1963,18 @@ int main(
                   port)
             ) {
                 cout
-                    << "Usage: PING <host> <port>\n";
+                    << "Usage: "
+                    << "PING <host> <port>\n";
+
+                continue;
+            }
+
+            if (
+                port < 1 ||
+                port > 65535
+            ) {
+                cout
+                    << "Invalid port\n";
 
                 continue;
             }
@@ -1802,7 +1984,6 @@ int main(
                 port
             );
         }
-
         else if (
             command == "INFO" ||
             command == "info"
@@ -1817,7 +1998,18 @@ int main(
                   port)
             ) {
                 cout
-                    << "Usage: INFO <host> <port>\n";
+                    << "Usage: "
+                    << "INFO <host> <port>\n";
+
+                continue;
+            }
+
+            if (
+                port < 1 ||
+                port > 65535
+            ) {
+                cout
+                    << "Invalid port\n";
 
                 continue;
             }
