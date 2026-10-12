@@ -1,0 +1,4 @@
+HYDRA_RAFT_METADATA_V1
+term 8
+vote node-2
+commit 11

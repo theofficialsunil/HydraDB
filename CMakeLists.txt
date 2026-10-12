@@ -17,6 +17,7 @@ add_executable(hydra
     src/cluster/cluster_manager.cpp
     src/sharding/shard_manager.cpp
     src/raft/raft_node.cpp
+    src/raft/raft_storage.cpp
 )
 
 target_include_directories(hydra PRIVATE

@@ -12,30 +12,8 @@
 #include <vector>
 
 #include "cluster/cluster_manager.h"
-
-enum class RaftRole {
-    FOLLOWER,
-    CANDIDATE,
-    LEADER
-};
-
-struct RaftLogEntry {
-    std::uint64_t index = 0;
-    std::uint64_t term = 0;
-    std::string command;
-};
-
-struct RaftProposalResult {
-    bool committed = false;
-
-    std::uint64_t index = 0;
-    std::uint64_t term = 0;
-
-    std::size_t acknowledgements = 0;
-    std::size_t majority = 0;
-
-    std::string message;
-};
+#include "raft_storage.h"
+#include "raft_types.h"
 
 class RaftNode {
 public:
@@ -59,11 +37,10 @@ private:
 
     ApplyCallback applyCallback;
 
+    RaftStorage persistentStorage;
+
     mutable std::mutex stateMutex;
 
-    // Prevent heartbeat replication and client proposal
-    // replication from manipulating the same peer progress
-    // simultaneously.
     std::mutex replicationMutex;
 
     std::atomic<bool> running{false};
@@ -73,34 +50,25 @@ private:
     RaftRole role =
         RaftRole::FOLLOWER;
 
+    // ========================================================
+    // Persistent Raft state
+    // ========================================================
+
     std::uint64_t currentTerm = 0;
 
     std::string votedFor;
-
-    std::string leaderId;
-
-    // --------------------------------------------------------
-    // Raft Log
-    //
-    // Entry zero is a sentinel.
-    // Real log entries begin at index 1.
-    // --------------------------------------------------------
 
     std::vector<RaftLogEntry> log;
 
     std::uint64_t commitIndex = 0;
 
-    std::uint64_t lastApplied = 0;
+    // ========================================================
+    // Volatile Raft state
+    // ========================================================
 
-    // --------------------------------------------------------
-    // Leader replication state
-    //
-    // nextIndex[node]
-    //     Next log entry the leader should send to that node.
-    //
-    // matchIndex[node]
-    //     Highest known replicated entry on that node.
-    // --------------------------------------------------------
+    std::string leaderId;
+
+    std::uint64_t lastApplied = 0;
 
     std::unordered_map<
         std::string,
@@ -147,6 +115,10 @@ private:
 
     std::uint64_t lastLogTermLocked() const;
 
+    bool persistMetadataLocked(
+        const std::string& context
+    );
+
     std::vector<std::string>
     collectCommittedCommandsLocked();
 
@@ -173,7 +145,7 @@ public:
 
     ~RaftNode();
 
-    void start();
+    bool start();
 
     void stop();
 

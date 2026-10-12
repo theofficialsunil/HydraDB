@@ -18,7 +18,8 @@ using namespace std;
 // Configuration
 // ============================================================
 
-struct NodeConfig {
+struct NodeConfig
+{
     string nodeId = "node-1";
 
     string host = "127.0.0.1";
@@ -32,7 +33,8 @@ struct NodeConfig {
 // Temporary Local Storage Engine
 // ============================================================
 
-class StorageEngine {
+class StorageEngine
+{
 private:
     unordered_map<string, string> data;
 
@@ -40,32 +42,30 @@ private:
 
 public:
     void put(
-        const string& key,
-        const string& value
-    ) {
+        const string &key,
+        const string &value)
+    {
         lock_guard<mutex> lock(
-            dataMutex
-        );
+            dataMutex);
 
         data[key] =
             value;
     }
 
     bool get(
-        const string& key,
-        string& value
-    ) const {
+        const string &key,
+        string &value) const
+    {
         lock_guard<mutex> lock(
-            dataMutex
-        );
+            dataMutex);
 
         auto it =
             data.find(key);
 
         if (
             it ==
-            data.end()
-        ) {
+            data.end())
+        {
             return false;
         }
 
@@ -76,24 +76,21 @@ public:
     }
 
     bool erase(
-        const string& key
-    ) {
+        const string &key)
+    {
         lock_guard<mutex> lock(
-            dataMutex
-        );
+            dataMutex);
 
-        return
-            data.erase(key) >
-            0;
+        return data.erase(key) >
+               0;
     }
 
-    size_t size() const {
+    size_t size() const
+    {
         lock_guard<mutex> lock(
-            dataMutex
-        );
+            dataMutex);
 
-        return
-            data.size();
+        return data.size();
     }
 };
 
@@ -102,29 +99,23 @@ public:
 // ============================================================
 
 vector<ShardNode> buildShardNodes(
-    const NodeConfig& config
-) {
+    const NodeConfig &config)
+{
     vector<ShardNode> nodes;
 
     nodes.push_back(
-        {
-            config.nodeId,
-            config.host,
-            config.port
-        }
-    );
+        {config.nodeId,
+         config.host,
+         config.port});
 
     for (
-        const auto& peer :
-        config.peers
-    ) {
+        const auto &peer :
+        config.peers)
+    {
         nodes.push_back(
-            {
-                peer.nodeId,
-                peer.host,
-                peer.port
-            }
-        );
+            {peer.nodeId,
+             peer.host,
+             peer.port});
     }
 
     return nodes;
@@ -134,7 +125,8 @@ vector<ShardNode> buildShardNodes(
 // HydraDB Node
 // ============================================================
 
-class HydraNode {
+class HydraNode
+{
 private:
     NodeConfig config;
 
@@ -156,37 +148,35 @@ private:
     // ========================================================
 
     bool findNode(
-        const string& nodeId,
-        ShardNode& result
-    ) const {
+        const string &nodeId,
+        ShardNode &result) const
+    {
         if (
             nodeId ==
-            config.nodeId
-        ) {
+            config.nodeId)
+        {
             result =
                 {
                     config.nodeId,
                     config.host,
-                    config.port
-                };
+                    config.port};
 
             return true;
         }
 
         for (
-            const auto& peer :
-            config.peers
-        ) {
+            const auto &peer :
+            config.peers)
+        {
             if (
                 peer.nodeId ==
-                nodeId
-            ) {
+                nodeId)
+            {
                 result =
                     {
                         peer.nodeId,
                         peer.host,
-                        peer.port
-                    };
+                        peer.port};
 
                 return true;
             }
@@ -205,19 +195,16 @@ private:
     // ========================================================
 
     void applyRaftCommand(
-        const string& command
-    ) {
+        const string &command)
+    {
         istringstream input(
-            command
-        );
+            command);
 
         string operation;
 
         size_t shardId;
 
-        input
-            >> operation
-            >> shardId;
+        input >> operation >> shardId;
 
         // This is already useful for the later
         // per-shard architecture.
@@ -227,19 +214,19 @@ private:
         if (
             !shardManager.nodeOwnsReplica(
                 config.nodeId,
-                shardId
-            )
-        ) {
+                shardId))
+        {
             return;
         }
 
         if (
             operation ==
-            "PUT"
-        ) {
+            "PUT")
+        {
             string key;
 
-            if (!(input >> key)) {
+            if (!(input >> key))
+            {
                 return;
             }
 
@@ -247,34 +234,33 @@ private:
 
             getline(
                 input >> ws,
-                value
-            );
+                value);
 
-            if (value.empty()) {
+            if (value.empty())
+            {
                 return;
             }
 
             storage.put(
                 key,
-                value
-            );
+                value);
 
             return;
         }
 
         if (
             operation ==
-            "DELETE"
-        ) {
+            "DELETE")
+        {
             string key;
 
-            if (!(input >> key)) {
+            if (!(input >> key))
+            {
                 return;
             }
 
             storage.erase(
-                key
-            );
+                key);
         }
     }
 
@@ -283,42 +269,34 @@ private:
     // ========================================================
 
     string formatProposalResult(
-        const RaftProposalResult& result
-    ) const {
+        const RaftProposalResult &result) const
+    {
         if (
-            result.committed
-        ) {
-            return
-                "OK COMMITTED"
-                " INDEX " +
-                to_string(
-                    result.index
-                ) +
-                " TERM " +
-                to_string(
-                    result.term
-                ) +
-                " ACKS " +
-                to_string(
-                    result.acknowledgements
-                ) +
-                "/" +
-                to_string(
-                    config.peers.size() + 1
-                );
+            result.committed)
+        {
+            return "OK COMMITTED"
+                   " INDEX " +
+                   to_string(
+                       result.index) +
+                   " TERM " +
+                   to_string(
+                       result.term) +
+                   " ACKS " +
+                   to_string(
+                       result.acknowledgements) +
+                   "/" +
+                   to_string(
+                       config.peers.size() + 1);
         }
 
-        return
-            "ERROR " +
-            result.message +
-            " ACKS " +
-            to_string(
-                result.acknowledgements
-            ) +
-            "/" +
-            to_string(
-                config.peers.size() + 1
-            );
+        return "ERROR " +
+               result.message +
+               " ACKS " +
+               to_string(
+                   result.acknowledgements) +
+               "/" +
+               to_string(
+                   config.peers.size() + 1);
     }
 
     // ========================================================
@@ -326,8 +304,8 @@ private:
     // ========================================================
 
     string handleNetworkRequest(
-        const string& request
-    ) {
+        const string &request)
+    {
         // ----------------------------------------------------
         // Raft RPC
         // ----------------------------------------------------
@@ -335,18 +313,14 @@ private:
         if (
             request.rfind(
                 "RAFT_",
-                0
-            ) == 0
-        ) {
-            return
-                raftNode.handleRequest(
-                    request
-                );
+                0) == 0)
+        {
+            return raftNode.handleRequest(
+                request);
         }
 
         istringstream input(
-            request
-        );
+            request);
 
         string command;
 
@@ -358,52 +332,46 @@ private:
 
         if (
             command ==
-            "CLIENT_PUT"
-        ) {
+            "CLIENT_PUT")
+        {
             if (
-                !raftNode.isLeader()
-            ) {
+                !raftNode.isLeader())
+            {
                 string leader =
                     raftNode.getLeaderId();
 
-                return
-                    "ERROR NOT_LEADER " +
-                    (
-                        leader.empty()
+                return "ERROR NOT_LEADER " +
+                       (leader.empty()
                             ? "UNKNOWN"
-                            : leader
-                    );
+                            : leader);
             }
 
             string key;
 
-            if (!(input >> key)) {
-                return
-                    "ERROR INVALID_CLIENT_PUT";
+            if (!(input >> key))
+            {
+                return "ERROR INVALID_CLIENT_PUT";
             }
 
             string value;
 
             getline(
                 input >> ws,
-                value
-            );
+                value);
 
-            if (value.empty()) {
-                return
-                    "ERROR INVALID_CLIENT_PUT";
+            if (value.empty())
+            {
+                return "ERROR INVALID_CLIENT_PUT";
             }
 
             size_t shardId =
                 shardManager.shardForKey(
-                    key
-                );
+                    key);
 
             string raftCommand =
                 "PUT " +
                 to_string(
-                    shardId
-                ) +
+                    shardId) +
                 " " +
                 key +
                 " " +
@@ -411,13 +379,10 @@ private:
 
             RaftProposalResult result =
                 raftNode.propose(
-                    raftCommand
-                );
+                    raftCommand);
 
-            return
-                formatProposalResult(
-                    result
-                );
+            return formatProposalResult(
+                result);
         }
 
         // ====================================================
@@ -426,52 +391,44 @@ private:
 
         if (
             command ==
-            "CLIENT_DELETE"
-        ) {
+            "CLIENT_DELETE")
+        {
             if (
-                !raftNode.isLeader()
-            ) {
+                !raftNode.isLeader())
+            {
                 string leader =
                     raftNode.getLeaderId();
 
-                return
-                    "ERROR NOT_LEADER " +
-                    (
-                        leader.empty()
+                return "ERROR NOT_LEADER " +
+                       (leader.empty()
                             ? "UNKNOWN"
-                            : leader
-                    );
+                            : leader);
             }
 
             string key;
 
-            if (!(input >> key)) {
-                return
-                    "ERROR INVALID_CLIENT_DELETE";
+            if (!(input >> key))
+            {
+                return "ERROR INVALID_CLIENT_DELETE";
             }
 
             size_t shardId =
                 shardManager.shardForKey(
-                    key
-                );
+                    key);
 
             string raftCommand =
                 "DELETE " +
                 to_string(
-                    shardId
-                ) +
+                    shardId) +
                 " " +
                 key;
 
             RaftProposalResult result =
                 raftNode.propose(
-                    raftCommand
-                );
+                    raftCommand);
 
-            return
-                formatProposalResult(
-                    result
-                );
+            return formatProposalResult(
+                result);
         }
 
         // ====================================================
@@ -480,28 +437,25 @@ private:
 
         if (
             command ==
-            "KVGET"
-        ) {
+            "KVGET")
+        {
             string key;
 
-            if (!(input >> key)) {
-                return
-                    "ERROR INVALID_KVGET";
+            if (!(input >> key))
+            {
+                return "ERROR INVALID_KVGET";
             }
 
             size_t shardId =
                 shardManager.shardForKey(
-                    key
-                );
+                    key);
 
             if (
                 !shardManager.nodeOwnsReplica(
                     config.nodeId,
-                    shardId
-                )
-            ) {
-                return
-                    "ERROR NOT_REPLICA";
+                    shardId))
+            {
+                return "ERROR NOT_REPLICA";
             }
 
             string value;
@@ -509,16 +463,13 @@ private:
             if (
                 !storage.get(
                     key,
-                    value
-                )
-            ) {
-                return
-                    "NOT_FOUND";
+                    value))
+            {
+                return "NOT_FOUND";
             }
 
-            return
-                "VALUE " +
-                value;
+            return "VALUE " +
+                   value;
         }
 
         // ====================================================
@@ -527,29 +478,24 @@ private:
 
         if (
             command ==
-            "REPLICA_GET"
-        ) {
+            "REPLICA_GET")
+        {
             size_t shardId;
 
             string key;
 
             if (
-                !(input
-                  >> shardId
-                  >> key)
-            ) {
-                return
-                    "ERROR INVALID_REPLICA_GET";
+                !(input >> shardId >> key))
+            {
+                return "ERROR INVALID_REPLICA_GET";
             }
 
             if (
                 !shardManager.nodeOwnsReplica(
                     config.nodeId,
-                    shardId
-                )
-            ) {
-                return
-                    "ERROR NOT_REPLICA";
+                    shardId))
+            {
+                return "ERROR NOT_REPLICA";
             }
 
             string value;
@@ -557,20 +503,16 @@ private:
             if (
                 !storage.get(
                     key,
-                    value
-                )
-            ) {
-                return
-                    "NOT_FOUND";
+                    value))
+            {
+                return "NOT_FOUND";
             }
 
-            return
-                "VALUE " +
-                value;
+            return "VALUE " +
+                   value;
         }
 
-        return
-            "ERROR UNKNOWN_COMMAND";
+        return "ERROR UNKNOWN_COMMAND";
     }
 
 public:
@@ -579,54 +521,46 @@ public:
     // ========================================================
 
     explicit HydraNode(
-        const NodeConfig& nodeConfig
-    )
+        const NodeConfig &nodeConfig)
         : config(
-              nodeConfig
-          ),
+              nodeConfig),
 
           shardManager(
               buildShardNodes(
-                  nodeConfig
-              ),
+                  nodeConfig),
               1024,
-              3
-          ),
+              3),
 
           networkServer(
               nodeConfig.nodeId,
               nodeConfig.port,
 
               [this](
-                  const string& request
-              ) {
-                  return
-                      handleNetworkRequest(
-                          request
-                      );
-              }
-          ),
+                  const string &request)
+              {
+                  return handleNetworkRequest(
+                      request);
+              }),
 
           clusterManager(
               nodeConfig.nodeId,
-              nodeConfig.peers
-          ),
+              nodeConfig.peers),
 
           raftNode(
               nodeConfig.nodeId,
               nodeConfig.peers,
 
               [this](
-                  const string& command
-              ) {
+                  const string &command)
+              {
                   applyRaftCommand(
-                      command
-                  );
-              }
-          ) {
+                      command);
+              })
+    {
     }
 
-    ~HydraNode() {
+    ~HydraNode()
+    {
         raftNode.stop();
 
         clusterManager.stop();
@@ -638,10 +572,11 @@ public:
     // Start
     // ========================================================
 
-    bool start() {
+    bool start()
+    {
         if (
-            !networkServer.start()
-        ) {
+            !networkServer.start())
+        {
             state =
                 "FAILED";
 
@@ -650,7 +585,21 @@ public:
 
         clusterManager.start();
 
-        raftNode.start();
+        if (
+            !raftNode.start())
+        {
+            cerr
+                << "Failed to recover/start Raft\n";
+
+            clusterManager.stop();
+
+            networkServer.stop();
+
+            state =
+                "FAILED";
+
+            return false;
+        }
 
         state =
             "RUNNING";
@@ -685,7 +634,10 @@ public:
             << "Network:      TCP\n";
 
         cout
-            << "Storage:      In-memory\n";
+            << "Storage:      In-memory state machine\n";
+
+        cout
+            << "Raft WAL:     Persistent\n";
 
         cout
             << "Peers:        "
@@ -720,26 +672,24 @@ public:
     // ========================================================
 
     void put(
-        const string& key,
-        const string& value
-    ) {
+        const string &key,
+        const string &value)
+    {
         size_t shardId =
             shardManager.shardForKey(
-                key
-            );
+                key);
 
         // ----------------------------------------------------
         // Local node is leader.
         // ----------------------------------------------------
 
         if (
-            raftNode.isLeader()
-        ) {
+            raftNode.isLeader())
+        {
             string command =
                 "PUT " +
                 to_string(
-                    shardId
-                ) +
+                    shardId) +
                 " " +
                 key +
                 " " +
@@ -747,8 +697,7 @@ public:
 
             RaftProposalResult result =
                 raftNode.propose(
-                    command
-                );
+                    command);
 
             cout
                 << "Shard:  "
@@ -757,8 +706,7 @@ public:
 
             cout
                 << formatProposalResult(
-                    result
-                )
+                       result)
                 << '\n';
 
             return;
@@ -772,8 +720,8 @@ public:
             raftNode.getLeaderId();
 
         if (
-            leaderId.empty()
-        ) {
+            leaderId.empty())
+        {
             cout
                 << "ERROR: no Raft leader available\n";
 
@@ -785,9 +733,8 @@ public:
         if (
             !findNode(
                 leaderId,
-                leader
-            )
-        ) {
+                leader))
+        {
             cout
                 << "ERROR: leader address unknown\n";
 
@@ -800,10 +747,9 @@ public:
                 leader.port,
 
                 "CLIENT_PUT " +
-                key +
-                " " +
-                value
-            );
+                    key +
+                    " " +
+                    value);
 
         cout
             << "RAFT ROUTE -> "
@@ -824,17 +770,15 @@ public:
     // ========================================================
 
     void get(
-        const string& key
-    ) const {
+        const string &key) const
+    {
         size_t shardId =
             shardManager.shardForKey(
-                key
-            );
+                key);
 
         vector<ShardNode> replicas =
             shardManager.replicasForShard(
-                shardId
-            );
+                shardId);
 
         // ----------------------------------------------------
         // Try local replica first.
@@ -843,17 +787,15 @@ public:
         if (
             shardManager.nodeOwnsReplica(
                 config.nodeId,
-                shardId
-            )
-        ) {
+                shardId))
+        {
             string value;
 
             if (
                 storage.get(
                     key,
-                    value
-                )
-            ) {
+                    value))
+            {
                 cout
                     << "READ -> "
                     << config.nodeId
@@ -874,13 +816,13 @@ public:
         // ----------------------------------------------------
 
         for (
-            const auto& replica :
-            replicas
-        ) {
+            const auto &replica :
+            replicas)
+        {
             if (
                 replica.nodeId ==
-                config.nodeId
-            ) {
+                config.nodeId)
+            {
                 continue;
             }
 
@@ -891,18 +833,15 @@ public:
 
                     "REPLICA_GET " +
                         to_string(
-                            shardId
-                        ) +
+                            shardId) +
                         " " +
-                        key
-                );
+                        key);
 
             if (
                 response.rfind(
                     "VALUE ",
-                    0
-                ) == 0
-            ) {
+                    0) == 0)
+            {
                 cout
                     << "READ -> "
                     << replica.nodeId
@@ -927,33 +866,29 @@ public:
     // ========================================================
 
     void erase(
-        const string& key
-    ) {
+        const string &key)
+    {
         size_t shardId =
             shardManager.shardForKey(
-                key
-            );
+                key);
 
         if (
-            raftNode.isLeader()
-        ) {
+            raftNode.isLeader())
+        {
             string command =
                 "DELETE " +
                 to_string(
-                    shardId
-                ) +
+                    shardId) +
                 " " +
                 key;
 
             RaftProposalResult result =
                 raftNode.propose(
-                    command
-                );
+                    command);
 
             cout
                 << formatProposalResult(
-                    result
-                )
+                       result)
                 << '\n';
 
             return;
@@ -963,8 +898,8 @@ public:
             raftNode.getLeaderId();
 
         if (
-            leaderId.empty()
-        ) {
+            leaderId.empty())
+        {
             cout
                 << "ERROR: no Raft leader available\n";
 
@@ -976,9 +911,8 @@ public:
         if (
             !findNode(
                 leaderId,
-                leader
-            )
-        ) {
+                leader))
+        {
             cout
                 << "ERROR: leader address unknown\n";
 
@@ -991,8 +925,7 @@ public:
                 leader.port,
 
                 "CLIENT_DELETE " +
-                key
-            );
+                    key);
 
         cout
             << "RAFT ROUTE -> "
@@ -1010,7 +943,8 @@ public:
     // Status
     // ========================================================
 
-    void status() const {
+    void status() const
+    {
         cout
             << "\nHydraDB Node Status\n";
 
@@ -1036,11 +970,9 @@ public:
 
         cout
             << "Network:        "
-            << (
-                networkServer.isRunning()
+            << (networkServer.isRunning()
                     ? "RUNNING"
-                    : "STOPPED"
-            )
+                    : "STOPPED")
             << '\n';
 
         cout
@@ -1086,52 +1018,51 @@ public:
 
         cout
             << "Raft leader:    "
-            << (
-                raftNode.getLeaderId().empty()
+            << (raftNode.getLeaderId().empty()
                     ? "UNKNOWN"
-                    : raftNode.getLeaderId()
-            )
+                    : raftNode.getLeaderId())
             << '\n';
 
         cout
             << "Storage:        In-memory\n\n";
     }
 
-    void clusterStatus() const {
+    void clusterStatus() const
+    {
         clusterManager
             .printClusterStatus();
     }
 
-    void raftStatus() const {
+    void raftStatus() const
+    {
         raftNode.printStatus();
     }
 
     void route(
-        const string& key
-    ) const {
+        const string &key) const
+    {
         shardManager.printRoute(
-            key
-        );
+            key);
     }
 
     void replicas(
-        const string& key
-    ) const {
+        const string &key) const
+    {
         shardManager
             .printReplicaPlacement(
-                key
-            );
+                key);
     }
 
-    void shardStatus() const {
+    void shardStatus() const
+    {
         shardManager
             .printDistribution();
     }
 
     void pingNode(
-        const string& host,
-        int port
-    ) const {
+        const string &host,
+        int port) const
+    {
         cout
             << "PING "
             << host
@@ -1140,20 +1071,18 @@ public:
             << " ... "
             << TcpClient::ping(
                    host,
-                   port
-               )
+                   port)
             << '\n';
     }
 
     void infoNode(
-        const string& host,
-        int port
-    ) const {
+        const string &host,
+        int port) const
+    {
         cout
             << TcpClient::info(
                    host,
-                   port
-               )
+                   port)
             << '\n';
     }
 };
@@ -1163,79 +1092,76 @@ public:
 // ============================================================
 
 bool parsePeer(
-    const string& value,
-    PeerConfig& peer
-) {
+    const string &value,
+    PeerConfig &peer)
+{
     size_t atPosition =
         value.find('@');
 
     if (
         atPosition ==
-        string::npos
-    ) {
+        string::npos)
+    {
         return false;
     }
 
     size_t colonPosition =
         value.find(
             ':',
-            atPosition + 1
-        );
+            atPosition + 1);
 
     if (
         colonPosition ==
-        string::npos
-    ) {
+        string::npos)
+    {
         return false;
     }
 
     peer.nodeId =
         value.substr(
             0,
-            atPosition
-        );
+            atPosition);
 
     peer.host =
         value.substr(
             atPosition + 1,
             colonPosition -
                 atPosition -
-                1
-        );
+                1);
 
     string portValue =
         value.substr(
-            colonPosition + 1
-        );
+            colonPosition + 1);
 
     if (
         peer.nodeId.empty() ||
         peer.host.empty() ||
-        portValue.empty()
-    ) {
+        portValue.empty())
+    {
         return false;
     }
 
-    try {
+    try
+    {
         peer.port =
             stoi(
-                portValue
-            );
+                portValue);
     }
-    catch (...) {
+    catch (...)
+    {
         return false;
     }
 
-    return
-        peer.port >= 1 &&
-        peer.port <= 65535;
+    return peer.port >= 1 &&
+           peer.port <= 65535;
 }
 
 // ============================================================
 // Program Help
 // ============================================================
 
-void printProgramHelp() {
+void printProgramHelp()
+{
     cout
         << "HydraDB Node\n\n";
 
@@ -1256,24 +1182,24 @@ void printProgramHelp() {
 
 bool parseArguments(
     int argc,
-    char* argv[],
-    NodeConfig& config
-) {
+    char *argv[],
+    NodeConfig &config)
+{
     for (
         int i = 1;
         i < argc;
-        ++i
-    ) {
+        ++i)
+    {
         string argument =
             argv[i];
 
         if (
             argument ==
-            "--node-id"
-        ) {
+            "--node-id")
+        {
             if (
-                i + 1 >= argc
-            ) {
+                i + 1 >= argc)
+            {
                 cerr
                     << "Missing value for --node-id\n";
 
@@ -1286,11 +1212,11 @@ bool parseArguments(
 
         else if (
             argument ==
-            "--host"
-        ) {
+            "--host")
+        {
             if (
-                i + 1 >= argc
-            ) {
+                i + 1 >= argc)
+            {
                 cerr
                     << "Missing value for --host\n";
 
@@ -1303,24 +1229,25 @@ bool parseArguments(
 
         else if (
             argument ==
-            "--port"
-        ) {
+            "--port")
+        {
             if (
-                i + 1 >= argc
-            ) {
+                i + 1 >= argc)
+            {
                 cerr
                     << "Missing value for --port\n";
 
                 return false;
             }
 
-            try {
+            try
+            {
                 config.port =
                     stoi(
-                        argv[++i]
-                    );
+                        argv[++i]);
             }
-            catch (...) {
+            catch (...)
+            {
                 cerr
                     << "Invalid port\n";
 
@@ -1329,8 +1256,8 @@ bool parseArguments(
 
             if (
                 config.port < 1 ||
-                config.port > 65535
-            ) {
+                config.port > 65535)
+            {
                 cerr
                     << "Invalid port\n";
 
@@ -1340,11 +1267,11 @@ bool parseArguments(
 
         else if (
             argument ==
-            "--peer"
-        ) {
+            "--peer")
+        {
             if (
-                i + 1 >= argc
-            ) {
+                i + 1 >= argc)
+            {
                 cerr
                     << "Missing value for --peer\n";
 
@@ -1359,9 +1286,8 @@ bool parseArguments(
             if (
                 !parsePeer(
                     value,
-                    peer
-                )
-            ) {
+                    peer))
+            {
                 cerr
                     << "Invalid peer format: "
                     << value
@@ -1371,22 +1297,22 @@ bool parseArguments(
             }
 
             config.peers.push_back(
-                peer
-            );
+                peer);
         }
 
         else if (
             argument ==
                 "--help" ||
             argument ==
-                "-h"
-        ) {
+                "-h")
+        {
             printProgramHelp();
 
             exit(0);
         }
 
-        else {
+        else
+        {
             cerr
                 << "Unknown argument: "
                 << argument
@@ -1397,13 +1323,13 @@ bool parseArguments(
     }
 
     for (
-        const auto& peer :
-        config.peers
-    ) {
+        const auto &peer :
+        config.peers)
+    {
         if (
             peer.nodeId ==
-            config.nodeId
-        ) {
+            config.nodeId)
+        {
             cerr
                 << "Cannot add local node as peer\n";
 
@@ -1418,7 +1344,8 @@ bool parseArguments(
 // CLI Help
 // ============================================================
 
-void printCommandHelp() {
+void printCommandHelp()
+{
     cout
         << "\nHydraDB Commands\n";
 
@@ -1471,27 +1398,25 @@ void printCommandHelp() {
 
 int main(
     int argc,
-    char* argv[]
-) {
+    char *argv[])
+{
     NodeConfig config;
 
     if (
         !parseArguments(
             argc,
             argv,
-            config
-        )
-    ) {
+            config))
+    {
         return 1;
     }
 
     HydraNode node(
-        config
-    );
+        config);
 
     if (
-        !node.start()
-    ) {
+        !node.start())
+    {
         cerr
             << "Failed to start HydraDB node\n";
 
@@ -1500,40 +1425,40 @@ int main(
 
     string line;
 
-    while (true) {
+    while (true)
+    {
         cout
             << "hydra> ";
 
         if (
             !getline(
                 cin,
-                line
-            )
-        ) {
+                line))
+        {
             break;
         }
 
         istringstream input(
-            line
-        );
+            line);
 
         string command;
 
         input >> command;
 
         if (
-            command.empty()
-        ) {
+            command.empty())
+        {
             continue;
         }
 
         if (
             command == "PUT" ||
-            command == "put"
-        ) {
+            command == "put")
+        {
             string key;
 
-            if (!(input >> key)) {
+            if (!(input >> key))
+            {
                 cout
                     << "Usage: PUT <key> <value>\n";
 
@@ -1544,12 +1469,11 @@ int main(
 
             getline(
                 input >> ws,
-                value
-            );
+                value);
 
             if (
-                value.empty()
-            ) {
+                value.empty())
+            {
                 cout
                     << "Usage: PUT <key> <value>\n";
 
@@ -1558,17 +1482,17 @@ int main(
 
             node.put(
                 key,
-                value
-            );
+                value);
         }
 
         else if (
             command == "GET" ||
-            command == "get"
-        ) {
+            command == "get")
+        {
             string key;
 
-            if (!(input >> key)) {
+            if (!(input >> key))
+            {
                 cout
                     << "Usage: GET <key>\n";
 
@@ -1576,17 +1500,17 @@ int main(
             }
 
             node.get(
-                key
-            );
+                key);
         }
 
         else if (
             command == "DELETE" ||
-            command == "delete"
-        ) {
+            command == "delete")
+        {
             string key;
 
-            if (!(input >> key)) {
+            if (!(input >> key))
+            {
                 cout
                     << "Usage: DELETE <key>\n";
 
@@ -1594,17 +1518,17 @@ int main(
             }
 
             node.erase(
-                key
-            );
+                key);
         }
 
         else if (
             command == "ROUTE" ||
-            command == "route"
-        ) {
+            command == "route")
+        {
             string key;
 
-            if (!(input >> key)) {
+            if (!(input >> key))
+            {
                 cout
                     << "Usage: ROUTE <key>\n";
 
@@ -1612,17 +1536,17 @@ int main(
             }
 
             node.route(
-                key
-            );
+                key);
         }
 
         else if (
             command == "REPLICAS" ||
-            command == "replicas"
-        ) {
+            command == "replicas")
+        {
             string key;
 
-            if (!(input >> key)) {
+            if (!(input >> key))
+            {
                 cout
                     << "Usage: REPLICAS <key>\n";
 
@@ -1630,51 +1554,48 @@ int main(
             }
 
             node.replicas(
-                key
-            );
+                key);
         }
 
         else if (
             command == "SHARDS" ||
-            command == "shards"
-        ) {
+            command == "shards")
+        {
             node.shardStatus();
         }
 
         else if (
             command == "CLUSTER" ||
-            command == "cluster"
-        ) {
+            command == "cluster")
+        {
             node.clusterStatus();
         }
 
         else if (
             command == "RAFT" ||
-            command == "raft"
-        ) {
+            command == "raft")
+        {
             node.raftStatus();
         }
 
         else if (
             command == "STATUS" ||
-            command == "status"
-        ) {
+            command == "status")
+        {
             node.status();
         }
 
         else if (
             command == "PING" ||
-            command == "ping"
-        ) {
+            command == "ping")
+        {
             string host;
 
             int port;
 
             if (
-                !(input
-                  >> host
-                  >> port)
-            ) {
+                !(input >> host >> port))
+            {
                 cout
                     << "Usage: PING <host> <port>\n";
 
@@ -1683,23 +1604,20 @@ int main(
 
             node.pingNode(
                 host,
-                port
-            );
+                port);
         }
 
         else if (
             command == "INFO" ||
-            command == "info"
-        ) {
+            command == "info")
+        {
             string host;
 
             int port;
 
             if (
-                !(input
-                  >> host
-                  >> port)
-            ) {
+                !(input >> host >> port))
+            {
                 cout
                     << "Usage: INFO <host> <port>\n";
 
@@ -1708,28 +1626,28 @@ int main(
 
             node.infoNode(
                 host,
-                port
-            );
+                port);
         }
 
         else if (
             command == "HELP" ||
-            command == "help"
-        ) {
+            command == "help")
+        {
             printCommandHelp();
         }
 
         else if (
             command == "EXIT" ||
-            command == "exit"
-        ) {
+            command == "exit")
+        {
             cout
                 << "Shutting down HydraDB node\n";
 
             break;
         }
 
-        else {
+        else
+        {
             cout
                 << "Unknown command. Type HELP\n";
         }
