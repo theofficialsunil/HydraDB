@@ -2,12 +2,14 @@
 
 #include "network/tcp_client.h"
 
+#include <algorithm>
 #include <chrono>
 #include <future>
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace std;
@@ -18,13 +20,26 @@ using namespace std;
 
 RaftNode::RaftNode(
     const string& localNodeId,
-    const vector<PeerConfig>& peers
+    const vector<PeerConfig>& peers,
+    ApplyCallback applyCallback
 )
     : localNodeId(localNodeId),
       peers(peers),
+      applyCallback(
+          std::move(applyCallback)
+      ),
       randomGenerator(
           random_device{}()
       ) {
+
+    // Sentinel log entry.
+    log.push_back(
+        {
+            0,
+            0,
+            ""
+        }
+    );
 }
 
 RaftNode::~RaftNode() {
@@ -60,6 +75,20 @@ size_t RaftNode::majorityCount() const {
         clusterSize / 2 + 1;
 }
 
+uint64_t
+RaftNode::lastLogIndexLocked() const {
+    return
+        static_cast<uint64_t>(
+            log.size() - 1
+        );
+}
+
+uint64_t
+RaftNode::lastLogTermLocked() const {
+    return
+        log.back().term;
+}
+
 void RaftNode::resetElectionDeadlineLocked() {
     uniform_int_distribution<int>
         distribution(
@@ -67,16 +96,84 @@ void RaftNode::resetElectionDeadlineLocked() {
             electionMaxMs
         );
 
-    int timeoutMs =
-        distribution(
-            randomGenerator
-        );
-
     electionDeadline =
         chrono::steady_clock::now() +
         chrono::milliseconds(
-            timeoutMs
+            distribution(
+                randomGenerator
+            )
         );
+}
+
+// ============================================================
+// Initialize nextIndex / matchIndex
+//
+// Called whenever this node becomes leader.
+// ============================================================
+
+void RaftNode::initializeLeaderStateLocked() {
+    nextIndex.clear();
+
+    matchIndex.clear();
+
+    uint64_t next =
+        lastLogIndexLocked() + 1;
+
+    for (
+        const auto& peer :
+        peers
+    ) {
+        nextIndex[
+            peer.nodeId
+        ] = next;
+
+        matchIndex[
+            peer.nodeId
+        ] = 0;
+    }
+}
+
+// ============================================================
+// Apply committed entries
+// ============================================================
+
+vector<string>
+RaftNode::collectCommittedCommandsLocked() {
+    vector<string> commands;
+
+    while (
+        lastApplied <
+        commitIndex
+    ) {
+        ++lastApplied;
+
+        commands.push_back(
+            log[
+                static_cast<size_t>(
+                    lastApplied
+                )
+            ].command
+        );
+    }
+
+    return commands;
+}
+
+void RaftNode::applyCommands(
+    const vector<string>& commands
+) {
+    if (!applyCallback) {
+        return;
+    }
+
+    for (
+        const auto& command :
+        commands
+    ) {
+        applyCallback(
+            command
+        );
+    }
 }
 
 // ============================================================
@@ -157,19 +254,23 @@ void RaftNode::stepDown(
     leaderId =
         newLeader;
 
+    nextIndex.clear();
+
+    matchIndex.clear();
+
     resetElectionDeadlineLocked();
 }
 
 // ============================================================
-// Main Raft Loop
+// Main Worker
 // ============================================================
 
 void RaftNode::run() {
     while (running) {
-        bool shouldStartElection =
+        bool startElectionNow =
             false;
 
-        bool shouldSendHeartbeat =
+        bool heartbeatNow =
             false;
 
         {
@@ -188,7 +289,7 @@ void RaftNode::run() {
                     now >=
                     nextHeartbeat
                 ) {
-                    shouldSendHeartbeat =
+                    heartbeatNow =
                         true;
 
                     nextHeartbeat =
@@ -203,20 +304,20 @@ void RaftNode::run() {
                     now >=
                     electionDeadline
                 ) {
-                    shouldStartElection =
+                    startElectionNow =
                         true;
                 }
             }
         }
 
         if (
-            shouldStartElection
+            startElectionNow
         ) {
             startElection();
         }
 
         if (
-            shouldSendHeartbeat
+            heartbeatNow
         ) {
             sendHeartbeats();
         }
@@ -233,6 +334,10 @@ void RaftNode::run() {
 
 void RaftNode::startElection() {
     uint64_t electionTerm;
+
+    uint64_t candidateLastIndex;
+
+    uint64_t candidateLastTerm;
 
     {
         lock_guard<mutex> lock(
@@ -259,6 +364,12 @@ void RaftNode::startElection() {
 
         leaderId.clear();
 
+        candidateLastIndex =
+            lastLogIndexLocked();
+
+        candidateLastTerm =
+            lastLogTermLocked();
+
         resetElectionDeadlineLocked();
     }
 
@@ -270,56 +381,18 @@ void RaftNode::startElection() {
         << electionTerm
         << '\n';
 
-    // We always vote for ourselves.
     size_t votes = 1;
 
     size_t majority =
         majorityCount();
 
-    // Single-node configuration.
-    if (
-        votes >=
-        majority
-    ) {
-        {
-            lock_guard<mutex> lock(
-                stateMutex
-            );
-
-            if (
-                role ==
-                    RaftRole::CANDIDATE &&
-                currentTerm ==
-                    electionTerm
-            ) {
-                role =
-                    RaftRole::LEADER;
-
-                leaderId =
-                    localNodeId;
-
-                nextHeartbeat =
-                    chrono::steady_clock::now();
-            }
-        }
-
-        return;
-    }
-
     struct VoteResult {
-        string peerId;
         string response;
     };
 
-    vector<future<VoteResult>>
-        futures;
-
-    // --------------------------------------------------------
-    // Send RequestVote RPCs concurrently.
-    //
-    // One dead node must not delay communication with
-    // healthy nodes.
-    // --------------------------------------------------------
+    vector<
+        future<VoteResult>
+    > futures;
 
     for (
         const auto& peer :
@@ -332,7 +405,9 @@ void RaftNode::startElection() {
                 [
                     this,
                     peer,
-                    electionTerm
+                    electionTerm,
+                    candidateLastIndex,
+                    candidateLastTerm
                 ]() {
                     string request =
                         "RAFT_REQUEST_VOTE " +
@@ -340,27 +415,27 @@ void RaftNode::startElection() {
                             electionTerm
                         ) +
                         " " +
-                        localNodeId;
+                        localNodeId +
+                        " " +
+                        to_string(
+                            candidateLastIndex
+                        ) +
+                        " " +
+                        to_string(
+                            candidateLastTerm
+                        );
 
-                    string response =
+                    return VoteResult{
                         TcpClient::request(
                             peer.host,
                             peer.port,
                             request
-                        );
-
-                    return VoteResult{
-                        peer.nodeId,
-                        response
+                        )
                     };
                 }
             )
         );
     }
-
-    // --------------------------------------------------------
-    // Process responses
-    // --------------------------------------------------------
 
     for (
         auto& future :
@@ -377,16 +452,14 @@ void RaftNode::startElection() {
             result.response
         );
 
-        string command;
+        string responseType;
 
-        uint64_t responseTerm =
-            0;
+        uint64_t responseTerm = 0;
 
         input
-            >> command
+            >> responseType
             >> responseTerm;
 
-        // Another node has a newer term.
         if (
             responseTerm >
             electionTerm
@@ -399,7 +472,7 @@ void RaftNode::startElection() {
         }
 
         if (
-            command ==
+            responseType ==
                 "RAFT_VOTE_GRANTED" &&
             responseTerm ==
                 electionTerm
@@ -416,10 +489,6 @@ void RaftNode::startElection() {
             stateMutex
         );
 
-        // We may have received a heartbeat while
-        // RequestVote RPCs were running.
-        //
-        // In that case role would no longer be CANDIDATE.
         if (
             role ==
                 RaftRole::CANDIDATE &&
@@ -433,6 +502,8 @@ void RaftNode::startElection() {
 
             leaderId =
                 localNodeId;
+
+            initializeLeaderStateLocked();
 
             nextHeartbeat =
                 chrono::steady_clock::now();
@@ -455,17 +526,408 @@ void RaftNode::startElection() {
             << votes
             << '\n';
 
-        // Send first heartbeat immediately.
+        // Immediately start synchronizing followers.
         sendHeartbeats();
     }
 }
 
 // ============================================================
-// Leader Heartbeats
+// Replicate one follower until it reaches targetIndex
+//
+// This is the core missing piece from the previous version.
+//
+// Example:
+//
+// leader:
+// 1 2 3 4 5
+//
+// follower:
+// 1 2 3
+//
+// nextIndex initially 6
+//
+// prev=5 -> reject
+// nextIndex -> 4
+//
+// send entry 4
+// send entry 5
+//
+// follower caught up.
+// ============================================================
+
+RaftNode::PeerReplicationResult
+RaftNode::replicatePeerToIndex(
+    const PeerConfig& peer,
+    uint64_t targetIndex,
+    uint64_t leaderTerm
+) {
+    PeerReplicationResult result;
+
+    result.responseTerm =
+        leaderTerm;
+
+    while (running) {
+        uint64_t currentNext;
+
+        uint64_t previousIndex;
+
+        uint64_t previousTerm;
+
+        uint64_t leaderCommit;
+
+        uint64_t entryIndex = 0;
+
+        uint64_t entryTerm = 0;
+
+        string entryCommand;
+
+        {
+            lock_guard<mutex> lock(
+                stateMutex
+            );
+
+            // Leadership changed while replication
+            // was happening.
+            if (
+                role !=
+                    RaftRole::LEADER ||
+                currentTerm !=
+                    leaderTerm
+            ) {
+                return result;
+            }
+
+            auto nextIt =
+                nextIndex.find(
+                    peer.nodeId
+                );
+
+            if (
+                nextIt ==
+                nextIndex.end()
+            ) {
+                nextIndex[
+                    peer.nodeId
+                ] =
+                    lastLogIndexLocked() + 1;
+
+                matchIndex[
+                    peer.nodeId
+                ] = 0;
+            }
+
+            currentNext =
+                nextIndex[
+                    peer.nodeId
+                ];
+
+            if (
+                currentNext == 0
+            ) {
+                currentNext = 1;
+
+                nextIndex[
+                    peer.nodeId
+                ] = 1;
+            }
+
+            previousIndex =
+                currentNext - 1;
+
+            if (
+                previousIndex >=
+                log.size()
+            ) {
+                previousIndex =
+                    lastLogIndexLocked();
+
+                currentNext =
+                    previousIndex + 1;
+
+                nextIndex[
+                    peer.nodeId
+                ] =
+                    currentNext;
+            }
+
+            previousTerm =
+                log[
+                    static_cast<size_t>(
+                        previousIndex
+                    )
+                ].term;
+
+            leaderCommit =
+                commitIndex;
+
+            // ------------------------------------------------
+            // If peer is behind, send exactly one missing
+            // log entry.
+            // ------------------------------------------------
+
+            if (
+                currentNext <=
+                lastLogIndexLocked()
+            ) {
+                const auto& entry =
+                    log[
+                        static_cast<size_t>(
+                            currentNext
+                        )
+                    ];
+
+                entryIndex =
+                    entry.index;
+
+                entryTerm =
+                    entry.term;
+
+                entryCommand =
+                    entry.command;
+            }
+        }
+
+        string request =
+            "RAFT_APPEND_ENTRIES " +
+            to_string(
+                leaderTerm
+            ) +
+            " " +
+            localNodeId +
+            " " +
+            to_string(
+                previousIndex
+            ) +
+            " " +
+            to_string(
+                previousTerm
+            ) +
+            " " +
+            to_string(
+                leaderCommit
+            ) +
+            " " +
+            to_string(
+                entryIndex
+            ) +
+            " " +
+            to_string(
+                entryTerm
+            );
+
+        if (
+            entryIndex != 0
+        ) {
+            request +=
+                " " +
+                entryCommand;
+        }
+
+        string response =
+            TcpClient::request(
+                peer.host,
+                peer.port,
+                request
+            );
+
+        istringstream input(
+            response
+        );
+
+        string responseType;
+
+        uint64_t responseTerm = 0;
+
+        uint64_t followerIndex = 0;
+
+        input
+            >> responseType
+            >> responseTerm
+            >> followerIndex;
+
+        // ----------------------------------------------------
+        // Higher term discovered.
+        // ----------------------------------------------------
+
+        if (
+            responseTerm >
+            leaderTerm
+        ) {
+            result.responseTerm =
+                responseTerm;
+
+            stepDown(
+                responseTerm
+            );
+
+            return result;
+        }
+
+        // ----------------------------------------------------
+        // Successful AppendEntries
+        // ----------------------------------------------------
+
+        if (
+            responseType ==
+                "RAFT_APPEND_ACK" &&
+            responseTerm ==
+                leaderTerm
+        ) {
+            {
+                lock_guard<mutex> lock(
+                    stateMutex
+                );
+
+                if (
+                    role !=
+                        RaftRole::LEADER ||
+                    currentTerm !=
+                        leaderTerm
+                ) {
+                    return result;
+                }
+
+                uint64_t acknowledgedIndex =
+                    followerIndex;
+
+                matchIndex[
+                    peer.nodeId
+                ] =
+                    max(
+                        matchIndex[
+                            peer.nodeId
+                        ],
+                        acknowledgedIndex
+                    );
+
+                nextIndex[
+                    peer.nodeId
+                ] =
+                    matchIndex[
+                        peer.nodeId
+                    ] +
+                    1;
+
+                result.matchIndex =
+                    matchIndex[
+                        peer.nodeId
+                    ];
+
+                if (
+                    result.matchIndex >=
+                    targetIndex
+                ) {
+                    result.success =
+                        true;
+
+                    return result;
+                }
+            }
+
+            // Peer acknowledged one missing entry,
+            // but is still behind targetIndex.
+            continue;
+        }
+
+        // ----------------------------------------------------
+        // Follower rejected because previous log entry
+        // did not match.
+        //
+        // Move nextIndex backwards and retry.
+        // ----------------------------------------------------
+
+        if (
+            responseType ==
+            "RAFT_APPEND_REJECT" &&
+            responseTerm ==
+                leaderTerm
+        ) {
+            lock_guard<mutex> lock(
+                stateMutex
+            );
+
+            if (
+                role !=
+                    RaftRole::LEADER ||
+                currentTerm !=
+                    leaderTerm
+            ) {
+                return result;
+            }
+
+            uint64_t oldNext =
+                nextIndex[
+                    peer.nodeId
+                ];
+
+            uint64_t suggestedNext =
+                followerIndex + 1;
+
+            // Follower is clearly shorter.
+            if (
+                suggestedNext <
+                oldNext
+            ) {
+                nextIndex[
+                    peer.nodeId
+                ] =
+                    max<uint64_t>(
+                        1,
+                        suggestedNext
+                    );
+            }
+            else {
+                // Same length but conflicting term.
+                // Walk backwards one entry.
+                if (
+                    oldNext > 1
+                ) {
+                    nextIndex[
+                        peer.nodeId
+                    ] =
+                        oldNext - 1;
+                }
+                else {
+                    nextIndex[
+                        peer.nodeId
+                    ] = 1;
+                }
+            }
+
+            continue;
+        }
+
+        // Network failure / malformed response.
+        return result;
+    }
+
+    return result;
+}
+
+// ============================================================
+// Heartbeat + automatic follower catch-up
 // ============================================================
 
 void RaftNode::sendHeartbeats() {
+    // If a client proposal is already replicating,
+    // that traffic itself acts like AppendEntries/heartbeat.
+    //
+    // Skip this heartbeat round instead of competing with it.
+
+    unique_lock<mutex> replicationLock(
+        replicationMutex,
+        try_to_lock
+    );
+
+    if (
+        !replicationLock.owns_lock()
+    ) {
+        return;
+    }
+
     uint64_t leaderTerm;
+
+    uint64_t targetIndex;
 
     {
         lock_guard<mutex> lock(
@@ -481,27 +943,19 @@ void RaftNode::sendHeartbeats() {
 
         leaderTerm =
             currentTerm;
+
+        targetIndex =
+            lastLogIndexLocked();
     }
 
-    struct HeartbeatResult {
-        string peerId;
-        string response;
-    };
-
-    vector<future<HeartbeatResult>>
-        futures;
+    vector<
+        future<PeerReplicationResult>
+    > futures;
 
     // --------------------------------------------------------
-    // Send heartbeats concurrently.
+    // A heartbeat now does more than "I'm alive".
     //
-    // Previously:
-    //
-    // leader -> dead node (wait)
-    //        -> healthy node
-    //
-    // That delay could allow healthy followers to time out.
-    //
-    // Now all peers are contacted independently.
+    // If a follower is behind, this also repairs its log.
     // --------------------------------------------------------
 
     for (
@@ -515,27 +969,15 @@ void RaftNode::sendHeartbeats() {
                 [
                     this,
                     peer,
+                    targetIndex,
                     leaderTerm
                 ]() {
-                    string request =
-                        "RAFT_HEARTBEAT " +
-                        to_string(
+                    return
+                        replicatePeerToIndex(
+                            peer,
+                            targetIndex,
                             leaderTerm
-                        ) +
-                        " " +
-                        localNodeId;
-
-                    string response =
-                        TcpClient::request(
-                            peer.host,
-                            peer.port,
-                            request
                         );
-
-                    return HeartbeatResult{
-                        peer.nodeId,
-                        response
-                    };
                 }
             )
         );
@@ -545,52 +987,205 @@ void RaftNode::sendHeartbeats() {
         auto& future :
         futures
     ) {
-        if (!running) {
-            return;
-        }
-
-        HeartbeatResult result =
+        PeerReplicationResult result =
             future.get();
 
-        istringstream input(
-            result.response
-        );
-
-        string command;
-
-        uint64_t responseTerm =
-            0;
-
-        input
-            >> command
-            >> responseTerm;
-
-        // A follower/candidate reports a newer term.
-        //
-        // A correct Raft leader must immediately step down.
         if (
-            responseTerm >
+            result.responseTerm >
             leaderTerm
         ) {
-            stepDown(
-                responseTerm
-            );
-
-            cout
-                << "\n[raft] "
-                << localNodeId
-                << " stepped down"
-                << " term="
-                << responseTerm
-                << '\n';
-
             return;
         }
     }
 }
 
 // ============================================================
-// Incoming Raft RPC
+// Propose command
+// ============================================================
+
+RaftProposalResult
+RaftNode::propose(
+    const string& command
+) {
+    RaftProposalResult result;
+
+    uint64_t proposalTerm;
+
+    uint64_t entryIndex;
+
+    {
+        lock_guard<mutex> lock(
+            stateMutex
+        );
+
+        if (
+            role !=
+            RaftRole::LEADER
+        ) {
+            result.message =
+                "NOT_LEADER";
+
+            return result;
+        }
+
+        proposalTerm =
+            currentTerm;
+
+        entryIndex =
+            lastLogIndexLocked() + 1;
+
+        log.push_back(
+            {
+                entryIndex,
+                proposalTerm,
+                command
+            }
+        );
+    }
+
+    result.index =
+        entryIndex;
+
+    result.term =
+        proposalTerm;
+
+    result.majority =
+        majorityCount();
+
+    // Leader itself contains the entry.
+    size_t acknowledgements = 1;
+
+    // --------------------------------------------------------
+    // Only one outbound replication round at a time.
+    // --------------------------------------------------------
+
+    {
+        unique_lock<mutex> replicationLock(
+            replicationMutex
+        );
+
+        vector<
+            future<PeerReplicationResult>
+        > futures;
+
+        for (
+            const auto& peer :
+            peers
+        ) {
+            futures.push_back(
+                async(
+                    launch::async,
+
+                    [
+                        this,
+                        peer,
+                        entryIndex,
+                        proposalTerm
+                    ]() {
+                        return
+                            replicatePeerToIndex(
+                                peer,
+                                entryIndex,
+                                proposalTerm
+                            );
+                    }
+                )
+            );
+        }
+
+        for (
+            auto& future :
+            futures
+        ) {
+            PeerReplicationResult peerResult =
+                future.get();
+
+            if (
+                peerResult.responseTerm >
+                proposalTerm
+            ) {
+                result.acknowledgements =
+                    acknowledgements;
+
+                result.message =
+                    "HIGHER_TERM";
+
+                return result;
+            }
+
+            if (
+                peerResult.success &&
+                peerResult.matchIndex >=
+                    entryIndex
+            ) {
+                ++acknowledgements;
+            }
+        }
+    }
+
+    result.acknowledgements =
+        acknowledgements;
+
+    vector<string>
+        commandsToApply;
+
+    // ========================================================
+    // Majority reached -> commit
+    // ========================================================
+
+    {
+        lock_guard<mutex> lock(
+            stateMutex
+        );
+
+        if (
+            role ==
+                RaftRole::LEADER &&
+            currentTerm ==
+                proposalTerm &&
+            acknowledgements >=
+                result.majority
+        ) {
+            commitIndex =
+                max(
+                    commitIndex,
+                    entryIndex
+                );
+
+            commandsToApply =
+                collectCommittedCommandsLocked();
+
+            result.committed =
+                true;
+
+            result.message =
+                "COMMITTED";
+        }
+        else {
+            result.message =
+                "QUORUM_NOT_REACHED";
+        }
+    }
+
+    applyCommands(
+        commandsToApply
+    );
+
+    // --------------------------------------------------------
+    // Send updated commitIndex to followers.
+    // --------------------------------------------------------
+
+    if (
+        result.committed
+    ) {
+        sendHeartbeats();
+    }
+
+    return result;
+}
+
+// ============================================================
+// Incoming Raft RPCs
 // ============================================================
 
 string RaftNode::handleRequest(
@@ -600,26 +1195,32 @@ string RaftNode::handleRequest(
         request
     );
 
-    string command;
+    string commandType;
 
-    input >> command;
+    input >> commandType;
 
     // ========================================================
     // RequestVote
     // ========================================================
 
     if (
-        command ==
+        commandType ==
         "RAFT_REQUEST_VOTE"
     ) {
         uint64_t candidateTerm;
 
         string candidateId;
 
+        uint64_t candidateLastIndex;
+
+        uint64_t candidateLastTerm;
+
         if (
             !(input
               >> candidateTerm
-              >> candidateId)
+              >> candidateId
+              >> candidateLastIndex
+              >> candidateLastTerm)
         ) {
             return
                 "ERROR INVALID_RAFT_REQUEST_VOTE";
@@ -628,10 +1229,6 @@ string RaftNode::handleRequest(
         lock_guard<mutex> lock(
             stateMutex
         );
-
-        // ----------------------------------------------------
-        // Candidate is stale.
-        // ----------------------------------------------------
 
         if (
             candidateTerm <
@@ -643,10 +1240,6 @@ string RaftNode::handleRequest(
                     currentTerm
                 );
         }
-
-        // ----------------------------------------------------
-        // Newer term discovered.
-        // ----------------------------------------------------
 
         if (
             candidateTerm >
@@ -661,16 +1254,37 @@ string RaftNode::handleRequest(
             votedFor.clear();
 
             leaderId.clear();
+
+            nextIndex.clear();
+
+            matchIndex.clear();
         }
 
-        // ----------------------------------------------------
-        // One vote per term.
-        // ----------------------------------------------------
+        uint64_t localLastIndex =
+            lastLogIndexLocked();
+
+        uint64_t localLastTerm =
+            lastLogTermLocked();
+
+        // Candidate must have a log at least as
+        // up-to-date as this node.
+        bool logUpToDate =
+            candidateLastTerm >
+                localLastTerm ||
+            (
+                candidateLastTerm ==
+                    localLastTerm &&
+                candidateLastIndex >=
+                    localLastIndex
+            );
 
         bool canVote =
-            votedFor.empty() ||
-            votedFor ==
-                candidateId;
+            (
+                votedFor.empty() ||
+                votedFor ==
+                    candidateId
+            ) &&
+            logUpToDate;
 
         if (canVote) {
             votedFor =
@@ -707,74 +1321,268 @@ string RaftNode::handleRequest(
     }
 
     // ========================================================
-    // Heartbeat
+    // AppendEntries
     // ========================================================
 
     if (
-        command ==
-        "RAFT_HEARTBEAT"
+        commandType ==
+        "RAFT_APPEND_ENTRIES"
     ) {
-        uint64_t heartbeatTerm;
+        uint64_t leaderTerm;
 
-        string heartbeatLeader;
+        string incomingLeaderId;
+
+        uint64_t previousIndex;
+
+        uint64_t previousTerm;
+
+        uint64_t leaderCommit;
+
+        uint64_t entryIndex;
+
+        uint64_t entryTerm;
 
         if (
             !(input
-              >> heartbeatTerm
-              >> heartbeatLeader)
+              >> leaderTerm
+              >> incomingLeaderId
+              >> previousIndex
+              >> previousTerm
+              >> leaderCommit
+              >> entryIndex
+              >> entryTerm)
         ) {
             return
-                "ERROR INVALID_RAFT_HEARTBEAT";
+                "ERROR INVALID_APPEND_ENTRIES";
         }
 
-        lock_guard<mutex> lock(
-            stateMutex
-        );
-
-        // ----------------------------------------------------
-        // Stale leader.
-        // ----------------------------------------------------
+        string entryCommand;
 
         if (
-            heartbeatTerm <
-            currentTerm
+            entryIndex != 0
         ) {
-            return
-                "RAFT_HEARTBEAT_REJECT " +
+            getline(
+                input >> ws,
+                entryCommand
+            );
+
+            if (
+                entryCommand.empty()
+            ) {
+                return
+                    "ERROR INVALID_APPEND_ENTRY";
+            }
+        }
+
+        vector<string>
+            commandsToApply;
+
+        string response;
+
+        {
+            lock_guard<mutex> lock(
+                stateMutex
+            );
+
+            // ------------------------------------------------
+            // Stale leader.
+            // ------------------------------------------------
+
+            if (
+                leaderTerm <
+                currentTerm
+            ) {
+                return
+                    "RAFT_APPEND_REJECT " +
+                    to_string(
+                        currentTerm
+                    ) +
+                    " " +
+                    to_string(
+                        lastLogIndexLocked()
+                    );
+            }
+
+            // ------------------------------------------------
+            // Discover newer term.
+            // ------------------------------------------------
+
+            if (
+                leaderTerm >
+                currentTerm
+            ) {
+                currentTerm =
+                    leaderTerm;
+
+                votedFor.clear();
+            }
+
+            role =
+                RaftRole::FOLLOWER;
+
+            leaderId =
+                incomingLeaderId;
+
+            nextIndex.clear();
+
+            matchIndex.clear();
+
+            resetElectionDeadlineLocked();
+
+            // =================================================
+            // Previous entry must exist.
+            // =================================================
+
+            if (
+                previousIndex >=
+                log.size()
+            ) {
+                return
+                    "RAFT_APPEND_REJECT " +
+                    to_string(
+                        currentTerm
+                    ) +
+                    " " +
+                    to_string(
+                        lastLogIndexLocked()
+                    );
+            }
+
+            // =================================================
+            // Previous entry must have same term.
+            // =================================================
+
+            if (
+                log[
+                    static_cast<size_t>(
+                        previousIndex
+                    )
+                ].term !=
+                previousTerm
+            ) {
+                return
+                    "RAFT_APPEND_REJECT " +
+                    to_string(
+                        currentTerm
+                    ) +
+                    " " +
+                    to_string(
+                        lastLogIndexLocked()
+                    );
+            }
+
+            uint64_t acknowledgedIndex =
+                previousIndex;
+
+            // =================================================
+            // Append one entry
+            // =================================================
+
+            if (
+                entryIndex != 0
+            ) {
+                // Entry must immediately follow prevLogIndex.
+                if (
+                    entryIndex !=
+                    previousIndex + 1
+                ) {
+                    return
+                        "RAFT_APPEND_REJECT " +
+                        to_string(
+                            currentTerm
+                        ) +
+                        " " +
+                        to_string(
+                            lastLogIndexLocked()
+                        );
+                }
+
+                // ---------------------------------------------
+                // Existing entry at same index.
+                // ---------------------------------------------
+
+                if (
+                    entryIndex <
+                    log.size()
+                ) {
+                    // Conflict:
+                    //
+                    // delete this entry and everything after it.
+                    if (
+                        log[
+                            static_cast<size_t>(
+                                entryIndex
+                            )
+                        ].term !=
+                        entryTerm
+                    ) {
+                        log.resize(
+                            static_cast<size_t>(
+                                entryIndex
+                            )
+                        );
+                    }
+                }
+
+                // ---------------------------------------------
+                // Append if entry no longer exists.
+                // ---------------------------------------------
+
+                if (
+                    entryIndex ==
+                    log.size()
+                ) {
+                    log.push_back(
+                        {
+                            entryIndex,
+                            entryTerm,
+                            entryCommand
+                        }
+                    );
+                }
+
+                // If entry already existed with same term,
+                // it is considered matched.
+
+                acknowledgedIndex =
+                    entryIndex;
+            }
+
+            // =================================================
+            // Advance follower commit index.
+            // =================================================
+
+            if (
+                leaderCommit >
+                commitIndex
+            ) {
+                commitIndex =
+                    min(
+                        leaderCommit,
+                        lastLogIndexLocked()
+                    );
+
+                commandsToApply =
+                    collectCommittedCommandsLocked();
+            }
+
+            response =
+                "RAFT_APPEND_ACK " +
                 to_string(
                     currentTerm
+                ) +
+                " " +
+                to_string(
+                    acknowledgedIndex
                 );
         }
 
-        // ----------------------------------------------------
-        // New term.
-        // ----------------------------------------------------
+        // Apply outside Raft mutex.
+        applyCommands(
+            commandsToApply
+        );
 
-        if (
-            heartbeatTerm >
-            currentTerm
-        ) {
-            currentTerm =
-                heartbeatTerm;
-
-            votedFor.clear();
-        }
-
-        // Valid AppendEntries/heartbeat from a leader
-        // at current or newer term forces follower state.
-        role =
-            RaftRole::FOLLOWER;
-
-        leaderId =
-            heartbeatLeader;
-
-        resetElectionDeadlineLocked();
-
-        return
-            "RAFT_HEARTBEAT_ACK " +
-            to_string(
-                currentTerm
-            );
+        return response;
     }
 
     return
@@ -797,24 +1605,24 @@ void RaftNode::printStatus() const {
         << "---------------------------------\n";
 
     cout
-        << "Node:        "
+        << "Node:          "
         << localNodeId
         << '\n';
 
     cout
-        << "Role:        "
+        << "Role:          "
         << roleToString(
             role
         )
         << '\n';
 
     cout
-        << "Term:        "
+        << "Term:          "
         << currentTerm
         << '\n';
 
     cout
-        << "Leader:      "
+        << "Leader:        "
         << (
             leaderId.empty()
                 ? "UNKNOWN"
@@ -823,7 +1631,7 @@ void RaftNode::printStatus() const {
         << '\n';
 
     cout
-        << "Voted For:   "
+        << "Voted For:     "
         << (
             votedFor.empty()
                 ? "-"
@@ -832,15 +1640,86 @@ void RaftNode::printStatus() const {
         << '\n';
 
     cout
-        << "Majority:    "
+        << "Last Log:      "
+        << lastLogIndexLocked()
+        << '\n';
+
+    cout
+        << "Commit Index:  "
+        << commitIndex
+        << '\n';
+
+    cout
+        << "Last Applied:  "
+        << lastApplied
+        << '\n';
+
+    cout
+        << "Majority:      "
         << majorityCount()
         << '\n';
+
+    // --------------------------------------------------------
+    // Leader-only replication information
+    // --------------------------------------------------------
+
+    if (
+        role ==
+        RaftRole::LEADER
+    ) {
+        cout
+            << "\nFollower Progress\n";
+
+        for (
+            const auto& peer :
+            peers
+        ) {
+            uint64_t next = 0;
+
+            uint64_t matched = 0;
+
+            auto nextIt =
+                nextIndex.find(
+                    peer.nodeId
+                );
+
+            if (
+                nextIt !=
+                nextIndex.end()
+            ) {
+                next =
+                    nextIt->second;
+            }
+
+            auto matchIt =
+                matchIndex.find(
+                    peer.nodeId
+                );
+
+            if (
+                matchIt !=
+                matchIndex.end()
+            ) {
+                matched =
+                    matchIt->second;
+            }
+
+            cout
+                << "  "
+                << peer.nodeId
+                << "  match="
+                << matched
+                << "  next="
+                << next
+                << '\n';
+        }
+    }
 
     cout << '\n';
 }
 
 // ============================================================
-// State Accessors
+// Accessors
 // ============================================================
 
 RaftRole RaftNode::getRole() const {
@@ -858,6 +1737,34 @@ RaftNode::getCurrentTerm() const {
     );
 
     return currentTerm;
+}
+
+uint64_t
+RaftNode::getCommitIndex() const {
+    lock_guard<mutex> lock(
+        stateMutex
+    );
+
+    return commitIndex;
+}
+
+uint64_t
+RaftNode::getLastApplied() const {
+    lock_guard<mutex> lock(
+        stateMutex
+    );
+
+    return lastApplied;
+}
+
+uint64_t
+RaftNode::getLastLogIndex() const {
+    lock_guard<mutex> lock(
+        stateMutex
+    );
+
+    return
+        lastLogIndexLocked();
 }
 
 string RaftNode::getLeaderId() const {

@@ -15,12 +15,14 @@
 using namespace std;
 
 // ============================================================
-// Node Configuration
+// Configuration
 // ============================================================
 
 struct NodeConfig {
     string nodeId = "node-1";
+
     string host = "127.0.0.1";
+
     int port = 5001;
 
     vector<PeerConfig> peers;
@@ -28,14 +30,6 @@ struct NodeConfig {
 
 // ============================================================
 // Temporary Local Storage Engine
-//
-// Later:
-//
-// WAL
-//   ↓
-// MemTable
-//   ↓
-// SSTables
 // ============================================================
 
 class StorageEngine {
@@ -49,24 +43,34 @@ public:
         const string& key,
         const string& value
     ) {
-        lock_guard<mutex> lock(dataMutex);
+        lock_guard<mutex> lock(
+            dataMutex
+        );
 
-        data[key] = value;
+        data[key] =
+            value;
     }
 
     bool get(
         const string& key,
         string& value
     ) const {
-        lock_guard<mutex> lock(dataMutex);
+        lock_guard<mutex> lock(
+            dataMutex
+        );
 
-        auto it = data.find(key);
+        auto it =
+            data.find(key);
 
-        if (it == data.end()) {
+        if (
+            it ==
+            data.end()
+        ) {
             return false;
         }
 
-        value = it->second;
+        value =
+            it->second;
 
         return true;
     }
@@ -74,20 +78,27 @@ public:
     bool erase(
         const string& key
     ) {
-        lock_guard<mutex> lock(dataMutex);
+        lock_guard<mutex> lock(
+            dataMutex
+        );
 
-        return data.erase(key) > 0;
+        return
+            data.erase(key) >
+            0;
     }
 
     size_t size() const {
-        lock_guard<mutex> lock(dataMutex);
+        lock_guard<mutex> lock(
+            dataMutex
+        );
 
-        return data.size();
+        return
+            data.size();
     }
 };
 
 // ============================================================
-// Build Shard Node List
+// Build Logical Shard Node List
 // ============================================================
 
 vector<ShardNode> buildShardNodes(
@@ -103,7 +114,10 @@ vector<ShardNode> buildShardNodes(
         }
     );
 
-    for (const auto& peer : config.peers) {
+    for (
+        const auto& peer :
+        config.peers
+    ) {
         nodes.push_back(
             {
                 peer.nodeId,
@@ -126,11 +140,8 @@ private:
 
     StorageEngine storage;
 
-    string state = "STARTING";
-
-    // --------------------------------------------------------
-    // Distributed components
-    // --------------------------------------------------------
+    string state =
+        "STARTING";
 
     ShardManager shardManager;
 
@@ -141,144 +152,184 @@ private:
     RaftNode raftNode;
 
     // ========================================================
-    // Replicate PUT to follower replicas
-    //
-    // IMPORTANT:
-    // This is still our Step-5 replication mechanism.
-    //
-    // Raft is currently used only for leader election.
-    // In the next step, writes will go through the Raft log.
+    // Resolve cluster node by ID
     // ========================================================
 
-    size_t replicatePut(
-        size_t shardId,
-        const string& key,
-        const string& value
-    ) {
-        vector<ShardNode> replicas =
-            shardManager.replicasForShard(
-                shardId
-            );
+    bool findNode(
+        const string& nodeId,
+        ShardNode& result
+    ) const {
+        if (
+            nodeId ==
+            config.nodeId
+        ) {
+            result =
+                {
+                    config.nodeId,
+                    config.host,
+                    config.port
+                };
 
-        // Primary has already stored the value locally.
-        size_t acknowledgements = 1;
+            return true;
+        }
 
         for (
-            size_t i = 1;
-            i < replicas.size();
-            ++i
+            const auto& peer :
+            config.peers
         ) {
-            const auto& replica =
-                replicas[i];
-
-            string request =
-                "REPLICA_PUT " +
-                to_string(shardId) +
-                " " +
-                key +
-                " " +
-                value;
-
-            string response =
-                TcpClient::request(
-                    replica.host,
-                    replica.port,
-                    request
-                );
-
             if (
-                response ==
-                "OK REPLICA_STORED"
+                peer.nodeId ==
+                nodeId
             ) {
-                ++acknowledgements;
-            }
-            else {
-                cout
-                    << "\n[replication] "
-                    << replica.nodeId
-                    << " failed: "
-                    << response
-                    << '\n';
+                result =
+                    {
+                        peer.nodeId,
+                        peer.host,
+                        peer.port
+                    };
+
+                return true;
             }
         }
 
-        return acknowledgements;
+        return false;
     }
 
     // ========================================================
-    // Replicate DELETE
+    // Apply committed Raft command
+    //
+    // Commands:
+    //
+    // PUT <shard> <key> <value>
+    // DELETE <shard> <key>
     // ========================================================
 
-    size_t replicateDelete(
-        size_t shardId,
-        const string& key
+    void applyRaftCommand(
+        const string& command
     ) {
-        vector<ShardNode> replicas =
-            shardManager.replicasForShard(
+        istringstream input(
+            command
+        );
+
+        string operation;
+
+        size_t shardId;
+
+        input
+            >> operation
+            >> shardId;
+
+        // This is already useful for the later
+        // per-shard architecture.
+        //
+        // Only replica owners apply shard data.
+
+        if (
+            !shardManager.nodeOwnsReplica(
+                config.nodeId,
                 shardId
-            );
-
-        // Primary operation counts as one acknowledgement.
-        size_t acknowledgements = 1;
-
-        for (
-            size_t i = 1;
-            i < replicas.size();
-            ++i
+            )
         ) {
-            const auto& replica =
-                replicas[i];
-
-            string request =
-                "REPLICA_DELETE " +
-                to_string(shardId) +
-                " " +
-                key;
-
-            string response =
-                TcpClient::request(
-                    replica.host,
-                    replica.port,
-                    request
-                );
-
-            if (
-                response ==
-                    "OK REPLICA_DELETED" ||
-                response ==
-                    "NOT_FOUND"
-            ) {
-                ++acknowledgements;
-            }
-            else {
-                cout
-                    << "\n[replication] "
-                    << replica.nodeId
-                    << " failed: "
-                    << response
-                    << '\n';
-            }
+            return;
         }
 
-        return acknowledgements;
+        if (
+            operation ==
+            "PUT"
+        ) {
+            string key;
+
+            if (!(input >> key)) {
+                return;
+            }
+
+            string value;
+
+            getline(
+                input >> ws,
+                value
+            );
+
+            if (value.empty()) {
+                return;
+            }
+
+            storage.put(
+                key,
+                value
+            );
+
+            return;
+        }
+
+        if (
+            operation ==
+            "DELETE"
+        ) {
+            string key;
+
+            if (!(input >> key)) {
+                return;
+            }
+
+            storage.erase(
+                key
+            );
+        }
     }
 
     // ========================================================
-    // Handle Internal Network Request
+    // Format proposal result
+    // ========================================================
+
+    string formatProposalResult(
+        const RaftProposalResult& result
+    ) const {
+        if (
+            result.committed
+        ) {
+            return
+                "OK COMMITTED"
+                " INDEX " +
+                to_string(
+                    result.index
+                ) +
+                " TERM " +
+                to_string(
+                    result.term
+                ) +
+                " ACKS " +
+                to_string(
+                    result.acknowledgements
+                ) +
+                "/" +
+                to_string(
+                    config.peers.size() + 1
+                );
+        }
+
+        return
+            "ERROR " +
+            result.message +
+            " ACKS " +
+            to_string(
+                result.acknowledgements
+            ) +
+            "/" +
+            to_string(
+                config.peers.size() + 1
+            );
+    }
+
+    // ========================================================
+    // Incoming Network Request
     // ========================================================
 
     string handleNetworkRequest(
         const string& request
     ) {
         // ----------------------------------------------------
-        // Raft RPCs
-        //
-        // Examples:
-        //
-        // RAFT_REQUEST_VOTE
-        // RAFT_HEARTBEAT
-        //
-        // Let RaftNode handle all RAFT_* traffic.
+        // Raft RPC
         // ----------------------------------------------------
 
         if (
@@ -287,40 +338,48 @@ private:
                 0
             ) == 0
         ) {
-            return raftNode.handleRequest(
-                request
-            );
+            return
+                raftNode.handleRequest(
+                    request
+                );
         }
 
-        // ----------------------------------------------------
-        // Existing data-plane messages
-        // ----------------------------------------------------
-
-        istringstream input(request);
+        istringstream input(
+            request
+        );
 
         string command;
 
         input >> command;
 
         // ====================================================
-        // KVPUT
-        //
-        // A request routed to this shard's fixed primary.
-        //
-        // NOTE:
-        // Fixed primary is still used for DATA in this step.
-        // Raft leader is not yet controlling writes.
+        // Client PUT received by Raft leader
         // ====================================================
 
         if (
             command ==
-            "KVPUT"
+            "CLIENT_PUT"
         ) {
+            if (
+                !raftNode.isLeader()
+            ) {
+                string leader =
+                    raftNode.getLeaderId();
+
+                return
+                    "ERROR NOT_LEADER " +
+                    (
+                        leader.empty()
+                            ? "UNKNOWN"
+                            : leader
+                    );
+            }
+
             string key;
 
             if (!(input >> key)) {
                 return
-                    "ERROR INVALID_KVPUT";
+                    "ERROR INVALID_CLIENT_PUT";
             }
 
             string value;
@@ -332,7 +391,7 @@ private:
 
             if (value.empty()) {
                 return
-                    "ERROR INVALID_KVPUT";
+                    "ERROR INVALID_CLIENT_PUT";
             }
 
             size_t shardId =
@@ -340,126 +399,83 @@ private:
                     key
                 );
 
-            ShardNode primary =
-                shardManager.primaryForShard(
+            string raftCommand =
+                "PUT " +
+                to_string(
                     shardId
+                ) +
+                " " +
+                key +
+                " " +
+                value;
+
+            RaftProposalResult result =
+                raftNode.propose(
+                    raftCommand
                 );
-
-            if (
-                primary.nodeId !=
-                config.nodeId
-            ) {
-                return
-                    "ERROR WRONG_PRIMARY " +
-                    primary.nodeId;
-            }
-
-            storage.put(
-                key,
-                value
-            );
-
-            size_t acknowledgements =
-                replicatePut(
-                    shardId,
-                    key,
-                    value
-                );
-
-            size_t replicationFactor =
-                shardManager
-                    .getReplicationFactor();
-
-            size_t quorum =
-                replicationFactor /
-                    2 +
-                1;
-
-            if (
-                acknowledgements <
-                quorum
-            ) {
-                return
-                    "ERROR QUORUM_NOT_REACHED " +
-                    to_string(
-                        acknowledgements
-                    ) +
-                    "/" +
-                    to_string(
-                        replicationFactor
-                    );
-            }
 
             return
-                "OK REPLICATED " +
-                to_string(
-                    acknowledgements
-                ) +
-                "/" +
-                to_string(
-                    replicationFactor
-                ) +
-                " SHARD " +
-                to_string(
-                    shardId
+                formatProposalResult(
+                    result
                 );
         }
 
         // ====================================================
-        // REPLICA_PUT
+        // Client DELETE received by Raft leader
         // ====================================================
 
         if (
             command ==
-            "REPLICA_PUT"
+            "CLIENT_DELETE"
         ) {
-            size_t shardId;
+            if (
+                !raftNode.isLeader()
+            ) {
+                string leader =
+                    raftNode.getLeaderId();
+
+                return
+                    "ERROR NOT_LEADER " +
+                    (
+                        leader.empty()
+                            ? "UNKNOWN"
+                            : leader
+                    );
+            }
 
             string key;
 
-            if (
-                !(input >>
-                  shardId >>
-                  key)
-            ) {
+            if (!(input >> key)) {
                 return
-                    "ERROR INVALID_REPLICA_PUT";
+                    "ERROR INVALID_CLIENT_DELETE";
             }
 
-            string value;
+            size_t shardId =
+                shardManager.shardForKey(
+                    key
+                );
 
-            getline(
-                input >> ws,
-                value
-            );
+            string raftCommand =
+                "DELETE " +
+                to_string(
+                    shardId
+                ) +
+                " " +
+                key;
 
-            if (value.empty()) {
-                return
-                    "ERROR INVALID_REPLICA_PUT";
-            }
-
-            if (
-                !shardManager
-                    .nodeOwnsReplica(
-                        config.nodeId,
-                        shardId
-                    )
-            ) {
-                return
-                    "ERROR NOT_REPLICA";
-            }
-
-            storage.put(
-                key,
-                value
-            );
+            RaftProposalResult result =
+                raftNode.propose(
+                    raftCommand
+                );
 
             return
-                "OK REPLICA_STORED";
+                formatProposalResult(
+                    result
+                );
         }
 
         // ====================================================
-        // KVGET
+        // GET from logical shard primary
         // ====================================================
 
         if (
@@ -478,18 +494,14 @@ private:
                     key
                 );
 
-            ShardNode primary =
-                shardManager.primaryForShard(
-                    shardId
-                );
-
             if (
-                primary.nodeId !=
-                config.nodeId
+                !shardManager.nodeOwnsReplica(
+                    config.nodeId,
+                    shardId
+                )
             ) {
                 return
-                    "ERROR WRONG_PRIMARY " +
-                    primary.nodeId;
+                    "ERROR NOT_REPLICA";
             }
 
             string value;
@@ -510,7 +522,7 @@ private:
         }
 
         // ====================================================
-        // REPLICA_GET
+        // Replica GET
         // ====================================================
 
         if (
@@ -522,20 +534,19 @@ private:
             string key;
 
             if (
-                !(input >>
-                  shardId >>
-                  key)
+                !(input
+                  >> shardId
+                  >> key)
             ) {
                 return
                     "ERROR INVALID_REPLICA_GET";
             }
 
             if (
-                !shardManager
-                    .nodeOwnsReplica(
-                        config.nodeId,
-                        shardId
-                    )
+                !shardManager.nodeOwnsReplica(
+                    config.nodeId,
+                    shardId
+                )
             ) {
                 return
                     "ERROR NOT_REPLICA";
@@ -556,130 +567,6 @@ private:
             return
                 "VALUE " +
                 value;
-        }
-
-        // ====================================================
-        // KVDELETE
-        // ====================================================
-
-        if (
-            command ==
-            "KVDELETE"
-        ) {
-            string key;
-
-            if (!(input >> key)) {
-                return
-                    "ERROR INVALID_KVDELETE";
-            }
-
-            size_t shardId =
-                shardManager.shardForKey(
-                    key
-                );
-
-            ShardNode primary =
-                shardManager.primaryForShard(
-                    shardId
-                );
-
-            if (
-                primary.nodeId !=
-                config.nodeId
-            ) {
-                return
-                    "ERROR WRONG_PRIMARY " +
-                    primary.nodeId;
-            }
-
-            bool existed =
-                storage.erase(
-                    key
-                );
-
-            size_t acknowledgements =
-                replicateDelete(
-                    shardId,
-                    key
-                );
-
-            size_t replicationFactor =
-                shardManager
-                    .getReplicationFactor();
-
-            size_t quorum =
-                replicationFactor /
-                    2 +
-                1;
-
-            if (
-                acknowledgements <
-                quorum
-            ) {
-                return
-                    "ERROR QUORUM_NOT_REACHED " +
-                    to_string(
-                        acknowledgements
-                    ) +
-                    "/" +
-                    to_string(
-                        replicationFactor
-                    );
-            }
-
-            if (!existed) {
-                return
-                    "NOT_FOUND";
-            }
-
-            return
-                "OK DELETED";
-        }
-
-        // ====================================================
-        // REPLICA_DELETE
-        // ====================================================
-
-        if (
-            command ==
-            "REPLICA_DELETE"
-        ) {
-            size_t shardId;
-
-            string key;
-
-            if (
-                !(input >>
-                  shardId >>
-                  key)
-            ) {
-                return
-                    "ERROR INVALID_REPLICA_DELETE";
-            }
-
-            if (
-                !shardManager
-                    .nodeOwnsReplica(
-                        config.nodeId,
-                        shardId
-                    )
-            ) {
-                return
-                    "ERROR NOT_REPLICA";
-            }
-
-            bool existed =
-                storage.erase(
-                    key
-                );
-
-            if (!existed) {
-                return
-                    "NOT_FOUND";
-            }
-
-            return
-                "OK REPLICA_DELETED";
         }
 
         return
@@ -694,7 +581,9 @@ public:
     explicit HydraNode(
         const NodeConfig& nodeConfig
     )
-        : config(nodeConfig),
+        : config(
+              nodeConfig
+          ),
 
           shardManager(
               buildShardNodes(
@@ -725,16 +614,17 @@ public:
 
           raftNode(
               nodeConfig.nodeId,
-              nodeConfig.peers
+              nodeConfig.peers,
+
+              [this](
+                  const string& command
+              ) {
+                  applyRaftCommand(
+                      command
+                  );
+              }
           ) {
     }
-
-    // ========================================================
-    // Destructor
-    //
-    // Explicitly stop background services before member
-    // destruction begins.
-    // ========================================================
 
     ~HydraNode() {
         raftNode.stop();
@@ -745,13 +635,10 @@ public:
     }
 
     // ========================================================
-    // Start Node
+    // Start
     // ========================================================
 
     bool start() {
-        // Network must start first because both cluster
-        // heartbeats and Raft depend on TCP communication.
-
         if (
             !networkServer.start()
         ) {
@@ -761,10 +648,8 @@ public:
             return false;
         }
 
-        // Cluster health monitoring.
         clusterManager.start();
 
-        // Raft leader election.
         raftNode.start();
 
         state =
@@ -804,14 +689,12 @@ public:
 
         cout
             << "Peers:        "
-            << clusterManager
-                   .peerCount()
+            << clusterManager.peerCount()
             << '\n';
 
         cout
             << "Shards:       "
-            << shardManager
-                   .getShardCount()
+            << shardManager.getShardCount()
             << '\n';
 
         cout
@@ -821,7 +704,7 @@ public:
             << '\n';
 
         cout
-            << "Raft:         Election enabled\n";
+            << "Raft:         Log replication enabled\n";
 
         cout
             << "=================================\n";
@@ -833,7 +716,7 @@ public:
     }
 
     // ========================================================
-    // Distributed PUT
+    // PUT through Raft
     // ========================================================
 
     void put(
@@ -845,90 +728,86 @@ public:
                 key
             );
 
-        ShardNode primary =
-            shardManager.primaryForShard(
-                shardId
-            );
-
         // ----------------------------------------------------
-        // Local fixed shard primary
+        // Local node is leader.
         // ----------------------------------------------------
 
         if (
-            primary.nodeId ==
-            config.nodeId
+            raftNode.isLeader()
         ) {
-            storage.put(
-                key,
-                value
-            );
+            string command =
+                "PUT " +
+                to_string(
+                    shardId
+                ) +
+                " " +
+                key +
+                " " +
+                value;
 
-            size_t acknowledgements =
-                replicatePut(
-                    shardId,
-                    key,
-                    value
+            RaftProposalResult result =
+                raftNode.propose(
+                    command
                 );
 
-            size_t replicationFactor =
-                shardManager
-                    .getReplicationFactor();
-
-            size_t quorum =
-                replicationFactor /
-                    2 +
-                1;
-
             cout
-                << "Shard:    "
+                << "Shard:  "
                 << shardId
                 << '\n';
 
             cout
-                << "Primary:  "
-                << config.nodeId
+                << formatProposalResult(
+                    result
+                )
                 << '\n';
-
-            cout
-                << "Acks:     "
-                << acknowledgements
-                << '/'
-                << replicationFactor
-                << '\n';
-
-            if (
-                acknowledgements >=
-                quorum
-            ) {
-                cout
-                    << "OK: write reached quorum\n";
-            }
-            else {
-                cout
-                    << "ERROR: quorum not reached\n";
-            }
 
             return;
         }
 
         // ----------------------------------------------------
-        // Route to fixed primary
+        // Route to elected leader.
         // ----------------------------------------------------
+
+        string leaderId =
+            raftNode.getLeaderId();
+
+        if (
+            leaderId.empty()
+        ) {
+            cout
+                << "ERROR: no Raft leader available\n";
+
+            return;
+        }
+
+        ShardNode leader;
+
+        if (
+            !findNode(
+                leaderId,
+                leader
+            )
+        ) {
+            cout
+                << "ERROR: leader address unknown\n";
+
+            return;
+        }
 
         string response =
             TcpClient::request(
-                primary.host,
-                primary.port,
+                leader.host,
+                leader.port,
 
-                "KVPUT " +
-                    key +
-                    " " +
-                    value
+                "CLIENT_PUT " +
+                key +
+                " " +
+                value
             );
 
         cout
-            << "ROUTED -> "
-            << primary.nodeId
+            << "RAFT ROUTE -> "
+            << leaderId
             << " | shard="
             << shardId
             << '\n';
@@ -939,7 +818,9 @@ public:
     }
 
     // ========================================================
-    // Distributed GET
+    // GET
+    //
+    // Reads still use replica routing in this prototype.
     // ========================================================
 
     void get(
@@ -955,16 +836,15 @@ public:
                 shardId
             );
 
-        const ShardNode& primary =
-            replicas[0];
-
         // ----------------------------------------------------
-        // Local primary
+        // Try local replica first.
         // ----------------------------------------------------
 
         if (
-            primary.nodeId ==
-            config.nodeId
+            shardManager.nodeOwnsReplica(
+                config.nodeId,
+                shardId
+            )
         ) {
             string value;
 
@@ -975,115 +855,36 @@ public:
                 )
             ) {
                 cout
+                    << "READ -> "
+                    << config.nodeId
+                    << " | shard="
+                    << shardId
+                    << '\n';
+
+                cout
                     << value
                     << '\n';
+
+                return;
             }
-            else {
-                cout
-                    << "NOT_FOUND\n";
-            }
-
-            return;
         }
 
         // ----------------------------------------------------
-        // First try primary
+        // Try remote replicas.
         // ----------------------------------------------------
-
-        string response =
-            TcpClient::request(
-                primary.host,
-                primary.port,
-
-                "KVGET " +
-                    key
-            );
-
-        if (
-            response.rfind(
-                "VALUE ",
-                0
-            ) == 0
-        ) {
-            cout
-                << "READ -> primary "
-                << primary.nodeId
-                << " | shard="
-                << shardId
-                << '\n';
-
-            cout
-                << response.substr(6)
-                << '\n';
-
-            return;
-        }
-
-        if (
-            response ==
-            "NOT_FOUND"
-        ) {
-            cout
-                << "NOT_FOUND\n";
-
-            return;
-        }
-
-        // ----------------------------------------------------
-        // Primary unavailable.
-        // Try replicas.
-        // ----------------------------------------------------
-
-        cout
-            << "Primary "
-            << primary.nodeId
-            << " unavailable, "
-            << "trying replicas...\n";
 
         for (
-            size_t i = 1;
-            i < replicas.size();
-            ++i
+            const auto& replica :
+            replicas
         ) {
-            const auto& replica =
-                replicas[i];
-
-            // ----------------------------------------------
-            // Local replica
-            // ----------------------------------------------
-
             if (
                 replica.nodeId ==
                 config.nodeId
             ) {
-                string value;
-
-                if (
-                    storage.get(
-                        key,
-                        value
-                    )
-                ) {
-                    cout
-                        << "READ FALLBACK -> "
-                        << replica.nodeId
-                        << '\n';
-
-                    cout
-                        << value
-                        << '\n';
-
-                    return;
-                }
-
                 continue;
             }
 
-            // ----------------------------------------------
-            // Remote replica
-            // ----------------------------------------------
-
-            string replicaResponse =
+            string response =
                 TcpClient::request(
                     replica.host,
                     replica.port,
@@ -1097,19 +898,20 @@ public:
                 );
 
             if (
-                replicaResponse.rfind(
+                response.rfind(
                     "VALUE ",
                     0
                 ) == 0
             ) {
                 cout
-                    << "READ FALLBACK -> "
+                    << "READ -> "
                     << replica.nodeId
+                    << " | shard="
+                    << shardId
                     << '\n';
 
                 cout
-                    << replicaResponse
-                           .substr(6)
+                    << response.substr(6)
                     << '\n';
 
                 return;
@@ -1117,12 +919,11 @@ public:
         }
 
         cout
-            << "ERROR: no replica "
-            << "could serve the read\n";
+            << "NOT_FOUND\n";
     }
 
     // ========================================================
-    // Distributed DELETE
+    // DELETE through Raft
     // ========================================================
 
     void erase(
@@ -1133,70 +934,69 @@ public:
                 key
             );
 
-        ShardNode primary =
-            shardManager.primaryForShard(
-                shardId
-            );
+        if (
+            raftNode.isLeader()
+        ) {
+            string command =
+                "DELETE " +
+                to_string(
+                    shardId
+                ) +
+                " " +
+                key;
+
+            RaftProposalResult result =
+                raftNode.propose(
+                    command
+                );
+
+            cout
+                << formatProposalResult(
+                    result
+                )
+                << '\n';
+
+            return;
+        }
+
+        string leaderId =
+            raftNode.getLeaderId();
 
         if (
-            primary.nodeId ==
-            config.nodeId
+            leaderId.empty()
         ) {
-            bool existed =
-                storage.erase(
-                    key
-                );
+            cout
+                << "ERROR: no Raft leader available\n";
 
-            size_t acknowledgements =
-                replicateDelete(
-                    shardId,
-                    key
-                );
+            return;
+        }
 
-            size_t replicationFactor =
-                shardManager
-                    .getReplicationFactor();
+        ShardNode leader;
 
-            size_t quorum =
-                replicationFactor /
-                    2 +
-                1;
-
-            if (
-                acknowledgements <
-                quorum
-            ) {
-                cout
-                    << "ERROR: delete quorum "
-                    << "not reached\n";
-
-                return;
-            }
-
-            if (existed) {
-                cout
-                    << "OK: deleted\n";
-            }
-            else {
-                cout
-                    << "NOT_FOUND\n";
-            }
+        if (
+            !findNode(
+                leaderId,
+                leader
+            )
+        ) {
+            cout
+                << "ERROR: leader address unknown\n";
 
             return;
         }
 
         string response =
             TcpClient::request(
-                primary.host,
-                primary.port,
+                leader.host,
+                leader.port,
 
-                "KVDELETE " +
-                    key
+                "CLIENT_DELETE " +
+                key
             );
 
         cout
-            << "ROUTED -> "
-            << primary.nodeId
+            << "RAFT ROUTE -> "
+            << leaderId
             << " | shard="
             << shardId
             << '\n';
@@ -1207,7 +1007,7 @@ public:
     }
 
     // ========================================================
-    // Local Node Status
+    // Status
     // ========================================================
 
     void status() const {
@@ -1237,8 +1037,7 @@ public:
         cout
             << "Network:        "
             << (
-                networkServer
-                    .isRunning()
+                networkServer.isRunning()
                     ? "RUNNING"
                     : "STOPPED"
             )
@@ -1246,14 +1045,12 @@ public:
 
         cout
             << "Peers:          "
-            << clusterManager
-                   .peerCount()
+            << clusterManager.peerCount()
             << '\n';
 
         cout
             << "Virtual shards: "
-            << shardManager
-                   .getShardCount()
+            << shardManager.getShardCount()
             << '\n';
 
         cout
@@ -1268,41 +1065,31 @@ public:
             << '\n';
 
         cout
-            << "Raft role:      ";
-
-        if (
-            raftNode.getRole() ==
-            RaftRole::LEADER
-        ) {
-            cout << "LEADER";
-        }
-        else if (
-            raftNode.getRole() ==
-            RaftRole::CANDIDATE
-        ) {
-            cout << "CANDIDATE";
-        }
-        else {
-            cout << "FOLLOWER";
-        }
-
-        cout << '\n';
-
-        cout
             << "Raft term:      "
-            << raftNode
-                   .getCurrentTerm()
+            << raftNode.getCurrentTerm()
             << '\n';
 
-        string leaderId =
-            raftNode.getLeaderId();
+        cout
+            << "Raft log:       "
+            << raftNode.getLastLogIndex()
+            << '\n';
+
+        cout
+            << "Commit index:   "
+            << raftNode.getCommitIndex()
+            << '\n';
+
+        cout
+            << "Last applied:   "
+            << raftNode.getLastApplied()
+            << '\n';
 
         cout
             << "Raft leader:    "
             << (
-                leaderId.empty()
+                raftNode.getLeaderId().empty()
                     ? "UNKNOWN"
-                    : leaderId
+                    : raftNode.getLeaderId()
             )
             << '\n';
 
@@ -1310,26 +1097,14 @@ public:
             << "Storage:        In-memory\n\n";
     }
 
-    // ========================================================
-    // Cluster Status
-    // ========================================================
-
     void clusterStatus() const {
         clusterManager
             .printClusterStatus();
     }
 
-    // ========================================================
-    // Raft Status
-    // ========================================================
-
     void raftStatus() const {
         raftNode.printStatus();
     }
-
-    // ========================================================
-    // Sharding Diagnostics
-    // ========================================================
 
     void route(
         const string& key
@@ -1353,10 +1128,6 @@ public:
             .printDistribution();
     }
 
-    // ========================================================
-    // Networking Diagnostics
-    // ========================================================
-
     void pingNode(
         const string& host,
         int port
@@ -1366,13 +1137,11 @@ public:
             << host
             << ':'
             << port
-            << " ... ";
-
-        cout
+            << " ... "
             << TcpClient::ping(
-                host,
-                port
-            )
+                   host,
+                   port
+               )
             << '\n';
     }
 
@@ -1382,19 +1151,15 @@ public:
     ) const {
         cout
             << TcpClient::info(
-                host,
-                port
-            )
+                   host,
+                   port
+               )
             << '\n';
     }
 };
 
 // ============================================================
 // Peer Parser
-//
-// Format:
-//
-// node-2@127.0.0.1:5002
 // ============================================================
 
 bool parsePeer(
@@ -1453,7 +1218,9 @@ bool parsePeer(
 
     try {
         peer.port =
-            stoi(portValue);
+            stoi(
+                portValue
+            );
     }
     catch (...) {
         return false;
@@ -1481,28 +1248,10 @@ void printProgramHelp() {
         << "--host <host> "
         << "--port <port> "
         << "[--peer <id@host:port> ...]\n\n";
-
-    cout
-        << "Options:\n";
-
-    cout
-        << "  --node-id <id>\n";
-
-    cout
-        << "  --host <host>\n";
-
-    cout
-        << "  --port <port>\n";
-
-    cout
-        << "  --peer <id@host:port>\n";
-
-    cout
-        << "  --help, -h\n";
 }
 
 // ============================================================
-// Argument Parsing
+// Arguments
 // ============================================================
 
 bool parseArguments(
@@ -1517,10 +1266,6 @@ bool parseArguments(
     ) {
         string argument =
             argv[i];
-
-        // ----------------------------------------------------
-        // Node ID
-        // ----------------------------------------------------
 
         if (
             argument ==
@@ -1539,10 +1284,6 @@ bool parseArguments(
                 argv[++i];
         }
 
-        // ----------------------------------------------------
-        // Host
-        // ----------------------------------------------------
-
         else if (
             argument ==
             "--host"
@@ -1559,10 +1300,6 @@ bool parseArguments(
             config.host =
                 argv[++i];
         }
-
-        // ----------------------------------------------------
-        // Port
-        // ----------------------------------------------------
 
         else if (
             argument ==
@@ -1595,16 +1332,11 @@ bool parseArguments(
                 config.port > 65535
             ) {
                 cerr
-                    << "Port must be between "
-                    << "1 and 65535\n";
+                    << "Invalid port\n";
 
                 return false;
             }
         }
-
-        // ----------------------------------------------------
-        // Peer
-        // ----------------------------------------------------
 
         else if (
             argument ==
@@ -1621,23 +1353,19 @@ bool parseArguments(
 
             PeerConfig peer;
 
-            string peerValue =
+            string value =
                 argv[++i];
 
             if (
                 !parsePeer(
-                    peerValue,
+                    value,
                     peer
                 )
             ) {
                 cerr
                     << "Invalid peer format: "
-                    << peerValue
+                    << value
                     << '\n';
-
-                cerr
-                    << "Expected: "
-                    << "node-id@host:port\n";
 
                 return false;
             }
@@ -1646,10 +1374,6 @@ bool parseArguments(
                 peer
             );
         }
-
-        // ----------------------------------------------------
-        // Help
-        // ----------------------------------------------------
 
         else if (
             argument ==
@@ -1662,10 +1386,6 @@ bool parseArguments(
             exit(0);
         }
 
-        // ----------------------------------------------------
-        // Unknown
-        // ----------------------------------------------------
-
         else {
             cerr
                 << "Unknown argument: "
@@ -1676,10 +1396,6 @@ bool parseArguments(
         }
     }
 
-    // ========================================================
-    // Validate peer configuration after parsing everything.
-    // ========================================================
-
     for (
         const auto& peer :
         config.peers
@@ -1689,10 +1405,7 @@ bool parseArguments(
             config.nodeId
         ) {
             cerr
-                << "Cannot add local node "
-                << "as its own peer: "
-                << peer.nodeId
-                << '\n';
+                << "Cannot add local node as peer\n";
 
             return false;
         }
@@ -1822,8 +1535,7 @@ int main(
 
             if (!(input >> key)) {
                 cout
-                    << "Usage: "
-                    << "PUT <key> <value>\n";
+                    << "Usage: PUT <key> <value>\n";
 
                 continue;
             }
@@ -1839,8 +1551,7 @@ int main(
                 value.empty()
             ) {
                 cout
-                    << "Usage: "
-                    << "PUT <key> <value>\n";
+                    << "Usage: PUT <key> <value>\n";
 
                 continue;
             }
@@ -1886,6 +1597,7 @@ int main(
                 key
             );
         }
+
         else if (
             command == "ROUTE" ||
             command == "route"
@@ -1903,6 +1615,7 @@ int main(
                 key
             );
         }
+
         else if (
             command == "REPLICAS" ||
             command == "replicas"
@@ -1958,23 +1671,12 @@ int main(
             int port;
 
             if (
-                !(input >>
-                  host >>
-                  port)
+                !(input
+                  >> host
+                  >> port)
             ) {
                 cout
-                    << "Usage: "
-                    << "PING <host> <port>\n";
-
-                continue;
-            }
-
-            if (
-                port < 1 ||
-                port > 65535
-            ) {
-                cout
-                    << "Invalid port\n";
+                    << "Usage: PING <host> <port>\n";
 
                 continue;
             }
@@ -1984,6 +1686,7 @@ int main(
                 port
             );
         }
+
         else if (
             command == "INFO" ||
             command == "info"
@@ -1993,23 +1696,12 @@ int main(
             int port;
 
             if (
-                !(input >>
-                  host >>
-                  port)
+                !(input
+                  >> host
+                  >> port)
             ) {
                 cout
-                    << "Usage: "
-                    << "INFO <host> <port>\n";
-
-                continue;
-            }
-
-            if (
-                port < 1 ||
-                port > 65535
-            ) {
-                cout
-                    << "Invalid port\n";
+                    << "Usage: INFO <host> <port>\n";
 
                 continue;
             }
@@ -2039,8 +1731,7 @@ int main(
 
         else {
             cout
-                << "Unknown command. "
-                << "Type HELP\n";
+                << "Unknown command. Type HELP\n";
         }
     }
 
